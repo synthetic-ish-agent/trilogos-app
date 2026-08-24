@@ -12,7 +12,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 from google.genai.errors import APIError
-from lexicore.store import EvidenceStore
+from lexicore.store import EvidenceStore, DEFAULT_COLLECTION
 from lexicore.loaders import load_all
 from lexicore.llm import answer, assess
 
