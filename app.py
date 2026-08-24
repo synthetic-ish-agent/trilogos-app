@@ -354,31 +354,5 @@ def main():
             with st.chat_message("assistant"):
                 st.write(turn["answer"])
 
-    result = st.session_state.get("answer")
-    if result:
-        if result.reasoning:
-            with st.expander("Model reasoning"):
-                st.write(result.reasoning)
-        if result.limitations:
-            with st.expander("Limitations & constraints"):
-                for x in result.limitations:
-                    st.write(f"- {x}")
-
-        st.caption(f"Generation time: {st.session_state.get('elapsed', 0):.2f}s. Similarity is a ranking signal, not a truth probability.")
-
-        if st.session_state.get("weakness"):
-            w = st.session_state.weakness
-            with st.expander("Adversarial review"):
-                st.markdown("**Weakest points**")
-                for x in w.weakest_points:
-                    st.write(f"- {x}")
-                st.markdown("**Defense / qualification strategy**")
-                for x in w.defense_strategy:
-                    st.write(f"- {x}")
-                if w.unsupported_claims:
-                    st.markdown("**Unsupported claims**")
-                    for x in w.unsupported_claims:
-                        st.write(f"- {x}")
-
 if __name__ == "__main__":
     main()
