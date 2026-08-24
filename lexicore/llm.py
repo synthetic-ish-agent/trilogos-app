@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field
 
 from .core import Record
 
-
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -290,8 +289,6 @@ def context(
 # ============================================================
 # SYSTEM INSTRUCTIONS
 # ============================================================
-
-from __future__ import annotations
 
 def instructions(stance: str) -> str:
     base = f"""
