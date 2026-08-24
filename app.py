@@ -22,6 +22,13 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+st.markdown(
+    """
+    <link rel="manifest" href="app/static/manifest.json">
+    <meta name="theme-color" content="#1e293b">
+    """,
+    unsafe_allow_html=True
+)
 DB = os.getenv("LEXICORE_DB_PATH", "./chroma_db")
 COLLECTION = os.getenv("LEXICORE_COLLECTION", DEFAULT_COLLECTION)
 
