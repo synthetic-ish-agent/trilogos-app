@@ -343,7 +343,6 @@ to support the orthodox Christian position.
 
 6. INTELLECTUAL RIGOR & DISTINCTIONS
 Distinguish clearly between:
-- what the local database evidence directly establishes,
 - general theological knowledge and tradition,
 - orthodox interpretation,
 - and unresolved external uncertainty.
