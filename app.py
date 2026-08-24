@@ -24,7 +24,7 @@ st.set_page_config(
 )
 st.markdown(
     """
-    <link rel="manifest" href="app/static/manifest.json">
+    <link rel="manifest" href="static/manifest.json">
     <meta name="theme-color" content="#1e293b">
     """,
     unsafe_allow_html=True
