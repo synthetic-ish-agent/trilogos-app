@@ -12,7 +12,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 from google.genai.errors import APIError
-from lexicore.store import EvidenceStore, DEFAULT_COLLECTION
+from lexicore.store import EvidenceStore, lexicore_evidence_v3
 from lexicore.loaders import load_all
 from lexicore.llm import answer, assess
 
@@ -30,7 +30,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 DB = os.getenv("LEXICORE_DB_PATH", "./chroma_db")
-COLLECTION = os.getenv("LEXICORE_COLLECTION", DEFAULT_COLLECTION)
+COLLECTION = os.getenv("LEXICORE_COLLECTION", "lexicore_evidence_v3")
 
 @st.cache_resource(show_spinner="Initializing canonical evidence index...")
 def get_store():
