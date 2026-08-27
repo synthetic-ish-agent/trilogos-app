@@ -11,6 +11,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
+from google import genai
 from google.genai.errors import APIError
 from lexicore.store import EvidenceStore, DEFAULT_COLLECTION
 from lexicore.loaders import load_all
@@ -143,6 +144,21 @@ def generate_pdf(history: list, weakness_data) -> bytes:
     buffer.seek(0)
     return buffer.getvalue()
 
+def translate_text(text: str, target_lang: str) -> str:
+    """Helper to translate existing output text when language changes."""
+    if not text or target_lang == "English":
+        return text
+    try:
+        client = genai.Client()
+        response = client.models.generate_content(
+            model='gemini-3.6-flash',
+            contents=f"Translate the following theological research response accurately into {target_lang}. Preserve markdown formatting and structure:\n\n{text}"
+        )
+        return response.text
+    except Exception as e:
+        st.warning(f"Translation failed: {e}")
+        return text
+    
 def init():
     defaults = {
         "hits": [], 
@@ -158,13 +174,25 @@ def init():
         "setting_categories": [],
         "setting_n": 15,
         "setting_temp": 0.2,
-        "setting_lang": "English"
+        "setting_lang": "English",
+        "last_lang": "English"
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
 def main():
     init()
+
+    current_lang = st.session_state.get("setting_lang", "English")
+    if current_lang != st.session_state.get("last_lang", "English"):
+        st.session_state.last_lang = current_lang
+        if st.session_state.history:
+            with st.spinner(f"Transleting conversation thread to {current_lang}..."):
+                for turn in st.session_state.history:
+                    turn["answer"] = translate_text(turn["answer"], current_lang)
+                if st.session_state.get("answer") and hasattr(st.session_state.answer, "answer"):
+                    st.session_state.answer.answer = translate_text(st.session_state.answer.answer, current_lang)
+            st.rerun()
     
     # Centered Header Layout using columns and HTML/CSS
     _, center_col, _ = st.columns([1, 2, 1])
