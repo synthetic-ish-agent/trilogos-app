@@ -364,7 +364,8 @@ def main():
                 st.write(turn["query"])
             with st.chat_message("assistant"):
                 st.write(turn["answer"])
-result = st.sesssion_state.get("answer")
+
+result = st.session_state.get("answer")
 if result:
     if result.reasoning:
         with st.expander("Model reasoning"):
