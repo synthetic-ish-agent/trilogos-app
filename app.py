@@ -157,7 +157,8 @@ def init():
         "setting_stance": "Didactic/Explanatory",
         "setting_categories": [],
         "setting_n": 15,
-        "setting_temp": 0.2
+        "setting_temp": 0.2,
+        "setting_lang": "English"
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
@@ -197,6 +198,12 @@ def main():
             "Mode", 
             ["Didactic/Explanatory", "Scholarly (Debate)", "Skeptical/Contrarian"],
             key="setting_stance"
+        )
+
+        target_lang = st.selectbox(
+            "Display / Translation Language",
+            ["English", "French", "Arabic", "Hausa", "Igbo", "Yoruba"],
+            key="setting_lang"
         )
 
         selected_categories = st.multiselect(
@@ -290,12 +297,16 @@ def main():
                 st.stop()
             
             try:
+                effective_query = q
+                if target_lang and target_lang != "English":
+                    effective_query = f"{q}\n\n[Instruction: Provide the final response translated entirely into {target_lang}.]"
+
                 # Using st.status keeps all background retry logs hidden inside a clean expandable box
                 with st.status("Generating evidence-grounded response...", expanded=False) as status:
                     started = time.perf_counter()
 
                     result, used = answer(
-                        query=q, 
+                        query=effective_query, 
                         records=selected, 
                         stance=stance, 
                         temperature=temp, 
@@ -353,6 +364,31 @@ def main():
                 st.write(turn["query"])
             with st.chat_message("assistant"):
                 st.write(turn["answer"])
+result = st.sesssion_state.get("answer")
+if result:
+    if result.reasoning:
+        with st.expander("Model reasoning"):
+            st.write(result.reasoning)
+    if result.limitations:
+        with st.expander("Limitations & constraints"):
+            for x in result.limitations:
+                st.write(f"-{x}")
 
+    st.caption(f"Generation time: {st.session_state.get('elapsed', 0):.2f}s. Similarity is a ranking signal, not a truth probablity.")
+
+    if st.session_state.get("weakness"):
+        w = st.session_state.weakness
+        with st.expander("Adversarial review"):
+            st.markdown("**Weakest points**")
+            for x in w.weakest_points:
+                st.write(f"- {x}")
+            st.markdown("**Defense / qualification strategy**")
+            for x in w.defense_strategy:
+                st.write(f"- {x}")
+            if w.unsupported_claims:
+                st.markdown("**Unsupported claims**")
+                for x in w.unsupported_claims:
+                    st.write(f"- {x}")
+                           
 if __name__ == "__main__":
     main()
