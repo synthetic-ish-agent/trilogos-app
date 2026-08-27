@@ -393,16 +393,6 @@ def main():
             with st.chat_message("assistant"):
                 st.write(turn["answer"])
 
-result = st.session_state.get("answer")
-if result:
-    if result.reasoning:
-        with st.expander("Model reasoning"):
-            st.write(result.reasoning)
-    if result.limitations:
-        with st.expander("Limitations & constraints"):
-            for x in result.limitations:
-                st.write(f"-{x}")
-
     st.caption(f"Generation time: {st.session_state.get('elapsed', 0):.2f}s. Similarity is a ranking signal, not a truth probablity.")
 
     if st.session_state.get("weakness"):
