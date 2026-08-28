@@ -181,12 +181,16 @@ def get_next_client() -> genai.Client:
         ),
     )
 
-
 def rotate_key_on_error() -> bool:
     """
-    Move to the next configured API key.
+    Move to the next configured API key silently.
 
     Returns True when rotation actually occurred.
+
+    IMPORTANT:
+    API-key rotation is intentionally hidden from the user.
+    Internal API failures, key numbers, quotas, and retry details
+    should not be displayed in the application interface.
     """
 
     keys = get_available_keys()
@@ -199,14 +203,10 @@ def rotate_key_on_error() -> bool:
 
     st.session_state.lexicore_key_index = new_index
 
-    # Do not expose the actual API key.
-    st.warning(
-        f"⚠️ Gemini request failed on API key #{old_index + 1}. "
-        f"Retrying with API key #{new_index + 1}..."
-    )
+    # Intentionally no st.warning() here.
+    # Key rotation happens silently.
 
     return True
-
 
 def client() -> genai.Client:
     """

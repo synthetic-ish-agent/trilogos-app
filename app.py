@@ -189,21 +189,10 @@ def translate_text(
     """
     Translate an existing English response into the selected language.
 
-    Uses LexiCore's MULTI-KEY Gemini system.
+    Uses LexiCore's multi-key Gemini system.
 
-    If one API key receives a retryable error such as:
-        429 RESOURCE_EXHAUSTED
-        403
-        500
-        502
-        503
-        504
-        timeout
-
-    the function rotates to the next configured Google API key
-    and retries automatically.
-
-    This uses the same key pool as normal answer generation.
+    API failures and key rotation are intentionally hidden from
+    the user interface.
     """
 
     if not text:
@@ -215,33 +204,12 @@ def translate_text(
     try:
         keys = get_available_keys()
 
-    except Exception as exc:
-        st.error(
-            f"Translation could not load Google API keys: {exc}"
-        )
+    except Exception:
+        # Keep API configuration errors out of the UI.
         return text
 
     if not keys:
-        st.error(
-            "Translation could not find any configured "
-            "GOOGLE_API_KEY keys."
-        )
         return text
-
-    # --------------------------------------------------------
-    # Number of attempts
-    #
-    # Use every configured key once, just like LexiCore's
-    # normal generation system.
-    # --------------------------------------------------------
-
-    attempts = len(keys)
-
-    last_error = None
-
-    # --------------------------------------------------------
-    # Translation prompt
-    # --------------------------------------------------------
 
     prompt = f"""
 Translate the following theological research response
@@ -255,7 +223,7 @@ IMPORTANT RULES:
 - Do NOT omit information.
 - Do NOT add information.
 - Preserve the exact meaning.
-- Preserve all important theological terminology.
+- Preserve theological terminology accurately.
 - Preserve Bible references.
 - Preserve Quran references.
 - Preserve historical names and places.
@@ -280,9 +248,8 @@ ORIGINAL ENGLISH RESPONSE:
 {text}
 """
 
-    # --------------------------------------------------------
-    # Try every configured key.
-    # --------------------------------------------------------
+    attempts = len(keys)
+    last_error = None
 
     for attempt in range(attempts):
 
@@ -301,12 +268,12 @@ ORIGINAL ENGLISH RESPONSE:
                 None,
             )
 
-            if not translated:
-                raise RuntimeError(
-                    "Gemini returned an empty translation."
-                )
+            if translated:
+                return translated.strip()
 
-            return translated.strip()
+            last_error = RuntimeError(
+                "Empty translation response."
+            )
 
         except Exception as exc:
 
@@ -315,10 +282,6 @@ ORIGINAL ENGLISH RESPONSE:
             error_text = (
                 f"{type(exc).__name__}: {exc}"
             ).lower()
-
-            # ------------------------------------------------
-            # Determine whether the failure is retryable.
-            # ------------------------------------------------
 
             retryable = any(
                 marker in error_text
@@ -345,49 +308,30 @@ ORIGINAL ENGLISH RESPONSE:
                 )
             )
 
-            # ------------------------------------------------
-            # Non-retryable error.
-            # ------------------------------------------------
-
             if not retryable:
-
-                st.error(
-                    f"Translation to {target_lang} failed: "
-                    f"{exc}"
-                )
-
-                return text
-
-            # ------------------------------------------------
-            # Retryable error.
-            #
-            # Rotate to the next configured key.
-            # ------------------------------------------------
+                break
 
             if attempt < attempts - 1:
 
+                # Silent key rotation.
                 rotate_key_on_error()
 
-                # Small delay before retrying.
                 time.sleep(0.5)
 
                 continue
 
-            # ------------------------------------------------
-            # All keys exhausted.
-            # ------------------------------------------------
-
             break
 
     # --------------------------------------------------------
-    # All configured keys failed.
+    # IMPORTANT:
+    #
+    # Do NOT display the API error.
+    # Do NOT display the key number.
+    # Do NOT display quota information.
+    # Do NOT display the exception.
+    #
+    # Simply return the original text.
     # --------------------------------------------------------
-
-    st.error(
-        f"Translation to {target_lang} failed after "
-        f"trying all {len(keys)} configured Google API keys.\n\n"
-        f"Last error: {last_error}"
-    )
 
     return text
 
