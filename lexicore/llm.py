@@ -13,94 +13,31 @@ from pydantic import BaseModel, Field
 
 from .core import Record
 
-
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-MODEL = os.getenv(
-    "LEXICORE_LLM_MODEL",
-    "gemini-3.6-flash",
-)
+MODEL = os.getenv("LEXICORE_LLM_MODEL", "gemini-3.6-flash")
 
-# Keep requests bounded, but don't make normal responses wait
-# unnecessarily long.
+# Keep network requests reasonably bounded.
 REQUEST_TIMEOUT_MS = int(
-    os.getenv(
-        "LEXICORE_GEMINI_TIMEOUT_MS",
-        "90000",
-    )
+    os.getenv("LEXICORE_GEMINI_TIMEOUT_MS", "120000")
 )
 
-# Maximum number of API keys that may be tried for one request.
-#
-# 2 is normally enough. A request should not sit there trying
-# 5 keys before the user gets an error.
+# Number of attempts across configured API keys.
 MAX_KEY_ATTEMPTS = int(
-    os.getenv(
-        "LEXICORE_MAX_KEY_ATTEMPTS",
-        "2",
-    )
+    os.getenv("LEXICORE_MAX_KEY_ATTEMPTS", "5")
 )
 
-# Evidence context.
-#
-# Lowering this from 30,000 substantially reduces prompt size
-# and therefore improves latency while retaining enough evidence
-# for normal research questions.
+# Maximum evidence characters sent to Gemini.
 DEFAULT_MAX_CONTEXT_CHARS = int(
-    os.getenv(
-        "LEXICORE_MAX_CONTEXT_CHARS",
-        "18000",
-    )
+    os.getenv("LEXICORE_MAX_CONTEXT_CHARS", "30000")
 )
 
 # Maximum user query size.
 MAX_QUERY_CHARS = int(
-    os.getenv(
-        "LEXICORE_MAX_QUERY_CHARS",
-        "5000",
-    )
+    os.getenv("LEXICORE_MAX_QUERY_CHARS", "5000")
 )
-
-# Maximum number of previous turns included.
-#
-# We retain recent conversation context rather than repeatedly
-# sending the entire lifetime conversation.
-MAX_HISTORY_TURNS = int(
-    os.getenv(
-        "LEXICORE_MAX_HISTORY_TURNS",
-        "6",
-    )
-)
-
-# Maximum characters of one previous answer that are included
-# in follow-up context.
-MAX_HISTORY_ANSWER_CHARS = int(
-    os.getenv(
-        "LEXICORE_MAX_HISTORY_ANSWER_CHARS",
-        "5000",
-    )
-)
-
-# Maximum output.
-#
-# 4000 is unnecessarily large for most normal responses.
-MAX_OUTPUT_TOKENS = int(
-    os.getenv(
-        "LEXICORE_MAX_OUTPUT_TOKENS",
-        "2800",
-    )
-)
-
-# Small retry delay.
-RETRY_DELAY_SECONDS = float(
-    os.getenv(
-        "LEXICORE_RETRY_DELAY_SECONDS",
-        "0.15",
-    )
-)
-
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -108,7 +45,6 @@ T = TypeVar("T", bound=BaseModel)
 # ============================================================
 # RESPONSE SCHEMAS
 # ============================================================
-
 
 class Citation(BaseModel):
     evidence_id: str
@@ -132,14 +68,10 @@ class Weakness(BaseModel):
 # API KEY MANAGEMENT
 # ============================================================
 
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _load_api_keys() -> tuple[str, ...]:
+def get_available_keys() -> list[str]:
     """
-    Load Google API keys.
-
-    Keys are cached for 5 minutes so Streamlit reruns do not
-    repeatedly inspect secrets/environment variables.
+    Load numbered Google API keys from Streamlit secrets first,
+    then environment variables.
 
     Supported:
 
@@ -148,7 +80,7 @@ def _load_api_keys() -> tuple[str, ...]:
         ...
         GOOGLE_API_KEY_100
 
-    Fallback:
+    If no numbered keys exist, fall back to:
 
         GOOGLE_API_KEY
     """
@@ -160,22 +92,22 @@ def _load_api_keys() -> tuple[str, ...]:
     # --------------------------------------------------------
 
     for i in range(1, 101):
-
         secret_name = f"GOOGLE_API_KEY_{i}"
 
         value = None
 
+        # Streamlit secrets first.
         try:
             value = st.secrets.get(secret_name)
         except Exception:
             value = None
 
+        # Environment fallback.
         if not value:
             value = os.getenv(secret_name)
 
-        # Preserve the original behavior:
-        # stop at the first missing numbered key.
         if not value:
+            # Stop at the first missing numbered key.
             break
 
         key = str(value).strip()
@@ -188,7 +120,6 @@ def _load_api_keys() -> tuple[str, ...]:
     # --------------------------------------------------------
 
     if not keys:
-
         value = None
 
         try:
@@ -200,44 +131,29 @@ def _load_api_keys() -> tuple[str, ...]:
             value = os.getenv("GOOGLE_API_KEY")
 
         if value:
-
             key = str(value).strip()
 
             if key:
                 keys.append(key)
 
     if not keys:
-
         raise RuntimeError(
             "No Google API keys found.\n\n"
             "Configure GOOGLE_API_KEY_1, GOOGLE_API_KEY_2, etc. "
             "in .streamlit/secrets.toml."
         )
 
-    return tuple(keys)
-
-
-def get_available_keys() -> list[str]:
-    """
-    Public compatibility wrapper.
-
-    Existing application code can continue using this function.
-    """
-
-    return list(_load_api_keys())
+    return keys
 
 
 def _current_key_index() -> int:
     """
-    Return the current API-key index safely.
+    Return the current key index safely.
     """
 
     keys = get_available_keys()
 
-    index = st.session_state.get(
-        "lexicore_key_index",
-        0,
-    )
+    index = st.session_state.get("lexicore_key_index", 0)
 
     try:
         index = int(index)
@@ -247,44 +163,34 @@ def _current_key_index() -> int:
     return index % len(keys)
 
 
-@st.cache_resource(show_spinner=False)
-def _build_client(
-    api_key: str,
-) -> genai.Client:
-    """
-    Build and cache a Gemini client.
-
-    This avoids constructing a new client for every request.
-    """
-
-    return genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(
-            timeout=REQUEST_TIMEOUT_MS,
-        ),
-    )
-
-
 def get_next_client() -> genai.Client:
     """
-    Return a cached Gemini client using the currently selected
-    API key.
+    Create a Gemini client using the currently selected API key.
     """
 
     keys = get_available_keys()
 
     index = _current_key_index()
 
-    return _build_client(
-        keys[index],
-    )
+    key = keys[index]
 
+    return genai.Client(
+        api_key=key,
+        http_options=types.HttpOptions(
+            timeout=REQUEST_TIMEOUT_MS,
+        ),
+    )
 
 def rotate_key_on_error() -> bool:
     """
     Move to the next configured API key silently.
 
-    No API-key information is exposed to the user.
+    Returns True when rotation actually occurred.
+
+    IMPORTANT:
+    API-key rotation is intentionally hidden from the user.
+    Internal API failures, key numbers, quotas, and retry details
+    should not be displayed in the application interface.
     """
 
     keys = get_available_keys()
@@ -293,15 +199,14 @@ def rotate_key_on_error() -> bool:
         return False
 
     old_index = _current_key_index()
-
-    new_index = (
-        old_index + 1
-    ) % len(keys)
+    new_index = (old_index + 1) % len(keys)
 
     st.session_state.lexicore_key_index = new_index
 
-    return True
+    # Intentionally no st.warning() here.
+    # Key rotation happens silently.
 
+    return True
 
 def client() -> genai.Client:
     """
@@ -315,18 +220,20 @@ def client() -> genai.Client:
 # NETWORK DIAGNOSTICS
 # ============================================================
 
-
 def check_gemini_dns() -> tuple[bool, str]:
     """
     Lightweight DNS check.
+
+    This is useful because your current application error is:
+
+        [Errno 11001] getaddrinfo failed
+
+    which is a Windows hostname-resolution error.
     """
 
-    hostname = (
-        "generativelanguage.googleapis.com"
-    )
+    hostname = "generativelanguage.googleapis.com"
 
     try:
-
         addresses = socket.getaddrinfo(
             hostname,
             443,
@@ -334,107 +241,56 @@ def check_gemini_dns() -> tuple[bool, str]:
         )
 
         if addresses:
+            return True, f"{hostname} resolved successfully."
 
-            return (
-                True,
-                f"{hostname} resolved successfully.",
-            )
-
-        return (
-            False,
-            f"{hostname} returned no addresses.",
-        )
+        return False, f"{hostname} returned no addresses."
 
     except socket.gaierror as exc:
-
-        return (
-            False,
-            f"DNS resolution failed: {exc}",
-        )
+        return False, f"DNS resolution failed: {exc}"
 
     except Exception as exc:
-
-        return (
-            False,
-            f"DNS check failed: {exc}",
-        )
+        return False, f"DNS check failed: {exc}"
 
 
 # ============================================================
 # EVIDENCE CONTEXT
 # ============================================================
 
-
 def context(
     records: list[Record],
     max_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
 ):
     """
-    Build compact evidence context.
-
-    The evidence itself remains unchanged. We simply impose a
-    practical prompt budget so Gemini does not receive enormous
-    amounts of unnecessary text.
+    Build the evidence context while respecting the character limit.
     """
 
     parts: list[str] = []
-
     used: list[Record] = []
 
     total = 0
 
-    for i, record in enumerate(
-        records,
-        1,
-    ):
-
+    for i, record in enumerate(records, 1):
         block = record.evidence_block(i)
 
-        if not block:
-            continue
-
-        # If a single record is too large, don't allow it to
-        # consume the entire prompt.
+        # If this record alone is larger than the limit,
+        # skip it rather than exceeding the context budget.
         if len(block) > max_chars:
             continue
 
-        if (
-            total + len(block)
-            > max_chars
-        ):
+        if total + len(block) > max_chars:
             break
 
         parts.append(block)
-
         used.append(record)
-
         total += len(block)
 
-    return (
-        "\n\n".join(parts),
-        used,
-    )
-
+    return "\n\n".join(parts), used
 
 # ============================================================
 # SYSTEM INSTRUCTIONS
 # ============================================================
 
-
-@st.cache_data(
-    show_spinner=False,
-)
-def instructions(
-    stance: str,
-) -> str:
-    """
-    THE ARMOR / LexiCore master system instructions.
-
-    IMPORTANT:
-    These instructions intentionally preserve the existing
-    behavior and rules of the original implementation.
-    """
-
+def instructions(stance: str) -> str:
     base = f"""
 You are LexiCore (also known as THE ARMOR), an elite, uncompromising theological research, 
 apologetics, and cross-examination assistant. Your fundamental purpose, permanent stance, 
@@ -506,7 +362,6 @@ tradition of the universal Christian faith.
 """
 
     if "Didactic" in stance:
-
         return base + """
 
 MODE: DIDACTIC / EXPLANATORY
@@ -517,7 +372,6 @@ STRUCTURAL REQUIREMENT: Do not use raw bullet points, numbered headers, or mecha
 """
 
     if "Scholarly" in stance:
-
         return base + """
 
 MODE: SCHOLARLY / DEBATE
@@ -534,7 +388,6 @@ Seamlessly integrate your argument so that it reads like a professional theologi
 """
 
     if "Skeptical" in stance:
-
         return base + """
 
 MODE: SKEPTICAL / CONTRARIAN
@@ -551,26 +404,16 @@ STRUCTURAL REQUIREMENT: Avoid mechanical bullet points or numbered lists. Write 
 # ERROR CLASSIFICATION
 # ============================================================
 
-
-def _error_text(
-    exc: Exception,
-) -> str:
-
-    return (
-        f"{type(exc).__name__}: {exc}"
-    )
+def _error_text(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"
 
 
-def _is_retryable_error(
-    exc: Exception,
-) -> bool:
+def _is_retryable_error(exc: Exception) -> bool:
     """
-    Determine whether another key/request should be attempted.
+    Determine whether another API key/request should be attempted.
     """
 
-    text = _error_text(
-        exc
-    ).lower()
+    text = _error_text(exc).lower()
 
     retryable_markers = (
         "429",
@@ -580,11 +423,11 @@ def _is_retryable_error(
         "403",
         "permission_denied",
         "leaked",
+        "503",
+        "service unavailable",
         "500",
         "502",
-        "503",
         "504",
-        "service unavailable",
         "timeout",
         "timed out",
         "connecterror",
@@ -597,193 +440,59 @@ def _is_retryable_error(
         "unexpected eof",
     )
 
-    return any(
-        marker in text
-        for marker in retryable_markers
-    )
+    return any(marker in text for marker in retryable_markers)
 
 
 # ============================================================
 # RESPONSE PARSING
 # ============================================================
 
-
-def _parse_response(
-    response: Any,
-    schema: Type[T],
-) -> T:
+def _parse_response(response: Any, schema: Type[T]) -> T:
     """
-    Parse Gemini structured output.
+    Parse a Gemini response into the requested Pydantic model.
     """
 
-    parsed = getattr(
-        response,
-        "parsed",
-        None,
-    )
+    parsed = getattr(response, "parsed", None)
 
     if parsed is not None:
-
-        if isinstance(
-            parsed,
-            schema,
-        ):
+        if isinstance(parsed, schema):
             return parsed
 
-        return schema.model_validate(
-            parsed
-        )
+        return schema.model_validate(parsed)
 
-    text = getattr(
-        response,
-        "text",
-        None,
-    )
+    text = getattr(response, "text", None)
 
     if not text:
-
         raise RuntimeError(
             "Gemini returned an empty response."
         )
 
-    clean_text = str(
-        text
-    ).strip()
+    clean_text = str(text).strip()
 
     # Remove accidental Markdown JSON fences.
-    if clean_text.startswith(
-        "```json"
-    ):
+    if clean_text.startswith("```json"):
+        clean_text = clean_text[len("```json"):].strip()
 
-        clean_text = (
-            clean_text[
-                len("```json"):
-            ]
-            .strip()
-        )
+    elif clean_text.startswith("```"):
+        clean_text = clean_text[len("```"):].strip()
 
-    elif clean_text.startswith(
-        "```"
-    ):
-
-        clean_text = (
-            clean_text[
-                len("```"):
-            ]
-            .strip()
-        )
-
-    if clean_text.endswith(
-        "```"
-    ):
-
-        clean_text = (
-            clean_text[:-3]
-            .strip()
-        )
+    if clean_text.endswith("```"):
+        clean_text = clean_text[:-3].strip()
 
     try:
-
-        data = json.loads(
-            clean_text
-        )
-
+        data = json.loads(clean_text)
     except json.JSONDecodeError as exc:
-
         raise RuntimeError(
             "Gemini returned invalid JSON despite structured-output "
-            "configuration."
+            f"configuration.\n\nResponse:\n{clean_text[:5000]}"
         ) from exc
 
-    return schema.model_validate(
-        data
-    )
-
-
-# ============================================================
-# HISTORY COMPRESSION
-# ============================================================
-
-
-def _build_history(
-    history: Optional[
-        List[Dict[str, str]]
-    ],
-) -> str:
-    """
-    Build a compact conversation context.
-
-    Instead of sending the entire lifetime conversation,
-    only the most recent turns are included.
-
-    This preserves follow-up-question awareness while greatly
-    reducing prompt size.
-    """
-
-    if not history:
-        return ""
-
-    recent = history[
-        -MAX_HISTORY_TURNS:
-    ]
-
-    parts: list[str] = []
-
-    parts.append(
-        "RECENT CONVERSATION HISTORY:"
-    )
-
-    for turn in recent:
-
-        previous_query = str(
-            turn.get(
-                "query",
-                "",
-            )
-        ).strip()
-
-        previous_answer = str(
-            turn.get(
-                "original_answer",
-                turn.get(
-                    "answer",
-                    "",
-                ),
-            )
-        ).strip()
-
-        if previous_query:
-
-            parts.append(
-                f"User: {previous_query}"
-            )
-
-        if previous_answer:
-
-            if len(
-                previous_answer
-            ) > MAX_HISTORY_ANSWER_CHARS:
-
-                previous_answer = (
-                    previous_answer[
-                        :MAX_HISTORY_ANSWER_CHARS
-                    ]
-                    + "…"
-                )
-
-            parts.append(
-                f"LexiCore: {previous_answer}"
-            )
-
-        parts.append("")
-
-    return "\n".join(parts)
+    return schema.model_validate(data)
 
 
 # ============================================================
 # GEMINI GENERATION
 # ============================================================
-
 
 def _generate(
     prompt: str,
@@ -791,154 +500,140 @@ def _generate(
     stance: str,
     temperature: float = 0.2,
 ) -> T:
-    """
-    Fast Gemini generation with:
-
-    - cached clients
-    - cached system instructions
-    - bounded retries
-    - compact output
-    - structured responses
-    """
 
     keys = get_available_keys()
 
+    # Do not attempt more times than there are configured keys,
+    # but also respect MAX_KEY_ATTEMPTS.
     attempts = min(
         len(keys),
-        max(
-            1,
-            MAX_KEY_ATTEMPTS,
-        ),
+        max(1, MAX_KEY_ATTEMPTS),
     )
 
-    last_error: Optional[
-        Exception
-    ] = None
+    last_error: Optional[Exception] = None
 
-    for attempt in range(
-        attempts
-    ):
+    for attempt in range(attempts):
 
-        current_index = (
-            _current_key_index()
-        )
+        current_index = _current_key_index()
 
         try:
 
-            ai_client = (
-                get_next_client()
+            ai_client = get_next_client()
+
+            response = ai_client.models.generate_content(
+                model=MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=instructions(stance),
+                    temperature=max(0.0, min(float(temperature), 1.0)),
+                    max_output_tokens=4000,
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                ),
             )
 
-            response = (
-                ai_client.models.generate_content(
-                    model=MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=(
-                            instructions(
-                                stance
-                            )
-                        ),
-                        temperature=max(
-                            0.0,
-                            min(
-                                float(
-                                    temperature
-                                ),
-                                1.0,
-                            ),
-                        ),
-                        max_output_tokens=(
-                            MAX_OUTPUT_TOKENS
-                        ),
-                        response_mime_type=(
-                            "application/json"
-                        ),
-                        response_schema=schema,
-                    ),
-                )
-            )
-
-            return _parse_response(
-                response,
-                schema,
-            )
+            return _parse_response(response, schema)
 
         except Exception as exc:
 
             last_error = exc
 
-            if not _is_retryable_error(
-                exc
-            ):
-                raise RuntimeError(
-                    "LexiCore Gemini generation failed."
-                ) from exc
+            # ------------------------------------------------
+            # Retryable failure
+            # ------------------------------------------------
 
-            if (
-                attempt
-                >= attempts - 1
-            ):
-                break
+            if _is_retryable_error(exc):
 
-            # Rotate immediately.
-            rotate_key_on_error()
+                if attempt < attempts - 1:
 
-            # Very short delay.
-            if RETRY_DELAY_SECONDS > 0:
+                    rotate_key_on_error()
 
-                time.sleep(
-                    RETRY_DELAY_SECONDS
-                )
+                    # Small delay prevents immediate hammering.
+                    time.sleep(0.5)
+
+                    continue
+
+            # ------------------------------------------------
+            # Non-retryable failure
+            # ------------------------------------------------
+
+            raise RuntimeError(
+                f"LexiCore Gemini generation failed.\n\n"
+                f"Model: {MODEL}\n"
+                f"API key attempted: #{current_index + 1}\n"
+                f"Attempt: {attempt + 1}/{attempts}\n"
+                f"Error: {_error_text(exc)}"
+            ) from exc
 
     raise RuntimeError(
-        "LexiCore Gemini generation failed after "
-        f"{attempts} attempt(s)."
-    ) from last_error
+        "LexiCore Gemini generation failed after all available "
+        f"API keys were attempted. Last error: "
+        f"{_error_text(last_error) if last_error else 'unknown error'}"
+    )
 
 
 # ============================================================
 # ANSWER
 # ============================================================
 
-
 def answer(
     query: str,
     records: list[Record],
     stance: str = "Scholarly (Debate)",
     temperature: float = 0.2,
-    history: Optional[
-        List[Dict[str, str]]
-    ] = None,
+    history: Optional[List[Dict[str, str]]] = None,
 ):
-    """
-    Generate the canonical English THE ARMOR answer.
-
-    The answer rules and theological instructions remain unchanged.
-    """
 
     query = query.strip()
 
     if not query:
-
-        raise ValueError(
-            "Query cannot be empty."
-        )
+        raise ValueError("Query cannot be empty.")
 
     if len(query) > MAX_QUERY_CHARS:
-
         raise ValueError(
-            "Query exceeds the maximum allowed length "
+            f"Query exceeds the maximum allowed length "
             f"of {MAX_QUERY_CHARS} characters."
         )
 
-    ctx, used = context(
-        records
-    )
+    ctx, used = context(records)
 
-    history_text = _build_history(
-        history
-    )
+    # --------------------------------------------------------
+    # Conversation history
+    # --------------------------------------------------------
+
+    history_text = ""
+
+    if history:
+
+        history_text = (
+            "CONVERSATION HISTORY / PREVIOUS TURNS:\n"
+        )
+
+        for turn in history:
+
+            previous_query = str(
+                turn.get("query", "")
+            ).strip()
+
+            previous_answer = str(
+                turn.get("answer", "")
+            ).strip()
+
+            if previous_query:
+                history_text += (
+                    f"User: {previous_query}\n"
+                )
+
+            if previous_answer:
+                history_text += (
+                    f"LexiCore: {previous_answer}\n"
+                )
+
+            history_text += "\n"
+
+    # --------------------------------------------------------
+    # Prompt
+    # --------------------------------------------------------
 
     prompt = f"""
 {history_text}
@@ -984,20 +679,15 @@ Requirements:
     result.citations = [
         citation
         for citation in result.citations
-        if citation.evidence_id
-        in valid_ids
+        if citation.evidence_id in valid_ids
     ]
 
-    return (
-        result,
-        used,
-    )
+    return result, used
 
 
 # ============================================================
 # ARGUMENT ASSESSMENT
 # ============================================================
-
 
 def assess(
     argument: str,
@@ -1005,33 +695,21 @@ def assess(
     stance: str = "Scholarly (Debate)",
     temperature: float = 0.1,
 ):
-    """
-    Perform the existing adversarial review.
-
-    The behavior is retained.
-
-    For maximum application speed, app.py can call this lazily
-    rather than blocking initial answer display.
-    """
 
     argument = argument.strip()
 
     if not argument:
-
         raise ValueError(
             "Argument cannot be empty."
         )
 
     if len(argument) > MAX_QUERY_CHARS:
-
         raise ValueError(
-            "Argument exceeds the maximum allowed length "
+            f"Argument exceeds the maximum allowed length "
             f"of {MAX_QUERY_CHARS} characters."
         )
 
-    ctx, used = context(
-        records
-    )
+    ctx, used = context(records)
 
     prompt = f"""
 ARGUMENT TO ASSESS:
@@ -1071,7 +749,4 @@ Focus on whether the reasoning is actually supported.
         temperature=temperature,
     )
 
-    return (
-        result,
-        used,
-    )
+    return result, used
