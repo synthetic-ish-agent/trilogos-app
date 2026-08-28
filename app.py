@@ -1799,53 +1799,6 @@ selects another language.
             "Similarity is a ranking signal, not a truth probability."
         )
 
-        # ====================================================
-        # ADVERSARIAL REVIEW
-        # ====================================================
-
-        if st.session_state.get(
-            "weakness"
-        ):
-
-            w = st.session_state.weakness
-
-            with st.expander(
-                "Adversarial review"
-            ):
-
-                st.markdown(
-                    "**Weakest points**"
-                )
-
-                for x in w.weakest_points:
-
-                    st.write(
-                        f"- {x}"
-                    )
-
-                st.markdown(
-                    "**Defense / qualification strategy**"
-                )
-
-                for x in w.defense_strategy:
-
-                    st.write(
-                        f"- {x}"
-                    )
-
-                if w.unsupported_claims:
-
-                    st.markdown(
-                        "**Unsupported claims**"
-                    )
-
-                    for x in w.unsupported_claims:
-
-                        st.write(
-                            f"- {x}"
-                        )
-
-
 # ============================================================
 # APPLICATION ENTRY POINT
 # ============================================================
