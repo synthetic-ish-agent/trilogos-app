@@ -2,7 +2,7 @@ streamlit
 google-genai
 chromadb
 sentence-transformers
+torch
 torchvision
 reportlab
 pydantic
-rlbidi
