@@ -232,8 +232,7 @@ def main():
             "Display / Translation Language",
             ["English", "French", "Arabic", "Hausa", "Igbo", "Yoruba"],
             index=["English", "French", "Arabic", "Hausa", " Igbo", "Yoruba"],
-            key="setting_lang",
-            on_change=on_language_change
+            key="setting_lang"
         )
 
         selected_categories = st.multiselect(
