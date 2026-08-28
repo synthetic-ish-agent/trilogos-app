@@ -157,18 +157,6 @@ def translate_text(text: str, target_lang: str) -> str:
         return response.text
     except Exception as e:
         return text
-
-def on_language_change():
-    """Callback triggered instantly when the language selectbox changes."""
-    new_lang = st.session_state.get("setting_lang", "English")
-    old_lang = st.session_state.get("last_lang", "English")
-    if new_lang != old_lang:
-        st.session_state.last_lang = new_lang
-        if st.session_state.get("history"):
-            for turn in st.session_state.history:
-                turn["answer"] = translate_text(turn["answer"], new_lang)
-            if st.session_state.get("answer") and hasattr(st.session_state.answer, "answer"):
-                st.session_state.answer.answer = translate_text(st.session_state.answer.answer, new_lang)
     
 def init():
     defaults = {
@@ -193,6 +181,16 @@ def init():
 
 def main():
     init()
+
+    # Immediate check for language change outside of callbacks
+    current_lang = st.session_state.get("setting_lang", "English")
+    if current_lang != st.session_state.get("last_lang", "English"):
+        st.session_state.last_lang = current_lang
+        if st.session_state.get("history"):
+            for turn in st.session_state.history:
+                turn["answer"] = translate_text(turn["answer"], current_lang)
+            if st.session_state.get("answer") and hasattr(st.session_state.answer, "answer"):
+                st.session_state.answer.answer = translate_text(st.session_state.answer.answer, current_lang)
     
     # Centered Header Layout using columns and HTML/CSS
     _, center_col, _ = st.columns([1, 2, 1])
@@ -233,10 +231,8 @@ def main():
 
         target_lang = st.selectbox(
             "Display / Translation Language",
-            languages,
-            index=current_lang_idx,
-            key="setting_lang",
-            on_change=on_language_change
+            ["English", "French", "Arabic", "Hausa", "Igbo", "Yoruba"],
+            key="setting_lang"
         )
 
         selected_categories = st.multiselect(
