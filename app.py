@@ -35,6 +35,7 @@ from lexicore.llm import (
     rotate_key_on_error,
     MODEL,
 )
+from html import escape
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -571,77 +572,149 @@ def generate_pdf(
     language: str = "English",
 ) -> bytes:
     """
-    Generate a PDF using a Unicode-compatible font when available.
+    Generate a Unicode-safe THE ARMOR research PDF.
 
-    The function first looks for DejaVu Sans. If it cannot find
-    the font, it falls back to Helvetica instead of crashing
-    the entire Streamlit application.
+    Supported languages:
+        English
+        French
+        Hausa
+        Igbo
+        Yoruba
+        Arabic
 
-    NOTE:
-    DejaVu Sans is recommended for French, Hausa, Igbo and Yoruba.
-    Arabic requires additional RTL/shaping support for perfect output.
+    Font strategy:
+        - DejaVu Sans for Latin-based languages
+        - Noto Naskh Arabic for Arabic
+
+    Arabic:
+        - Uses ReportLab's RTL paragraph support when available.
+        - Uses shaping/bidi support when available.
+        - Falls back safely if optional RTL support is unavailable.
+
+    IMPORTANT:
+        The actual font files must exist in:
+
+            fonts/DejaVuSans.ttf
+            fonts/NotoNaskhArabic-Regular.ttf
     """
 
+    from pathlib import Path
+    from io import BytesIO
+
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import (
+        getSampleStyleSheet,
+        ParagraphStyle,
+    )
+    from reportlab.lib.units import mm
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.lib.enums import TA_CENTER
     from reportlab.platypus import (
         SimpleDocTemplate,
         Paragraph,
         Spacer,
         HRFlowable,
     )
-    from reportlab.lib.pagesizes import letter
-    from reportlab.lib.styles import (
-        getSampleStyleSheet,
-        ParagraphStyle,
+
+    # ========================================================
+    # FONT PATHS
+    # ========================================================
+
+    base_dir = Path(__file__).resolve().parent
+    fonts_dir = base_dir / "fonts"
+
+    latin_font_path = fonts_dir / "DejaVuSans.ttf"
+    arabic_font_path = (
+        fonts_dir / "NotoNaskhArabic-Regular.ttf"
     )
 
     # ========================================================
-    # FIND UNICODE FONT
+    # REGISTER LATIN FONT
     # ========================================================
 
-    font_candidates = [
-        # Bundled project font — RECOMMENDED
-        str(
-            Path(__file__).resolve().parent
-            / "fonts"
-            / "DejaVuSans.ttf"
-        ),
+    latin_font = "Helvetica"
 
-        # Linux / Streamlit Cloud
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    if latin_font_path.exists():
 
-        # Windows
-        "C:/Windows/Fonts/DejaVuSans.ttf",
-    ]
+        try:
 
-    font_name = "Helvetica"
-
-    for font_path in font_candidates:
-
-        if os.path.isfile(font_path):
-
-            try:
-
-                if "ArmorUnicode" not in pdfmetrics.getRegisteredFontNames():
-                    pdfmetrics.registerFont(
-                        TTFont(
-                            "ArmorUnicode",
-                            font_path,
-                        )
+            if "ArmorDejaVu" not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(
+                    TTFont(
+                        "ArmorDejaVu",
+                        str(latin_font_path),
                     )
+                )
 
-                font_name = "ArmorUnicode"
+            latin_font = "ArmorDejaVu"
 
-                break
-
-            except Exception:
-                continue
+        except Exception:
+            latin_font = "Helvetica"
 
     # ========================================================
-    # PDF DOCUMENT
+    # REGISTER ARABIC FONT
+    # ========================================================
+
+    arabic_font = latin_font
+
+    if arabic_font_path.exists():
+
+        try:
+
+            if (
+                "ArmorArabic"
+                not in pdfmetrics.getRegisteredFontNames()
+            ):
+                pdfmetrics.registerFont(
+                    TTFont(
+                        "ArmorArabic",
+                        str(arabic_font_path),
+                    )
+                )
+
+            arabic_font = "ArmorArabic"
+
+        except Exception:
+            arabic_font = latin_font
+
+    # ========================================================
+    # DETERMINE WHETHER THIS IS ARABIC
+    # ========================================================
+
+    is_arabic = (
+        str(language).strip().lower()
+        in {
+            "arabic",
+            "العربية",
+            "عربي",
+        }
+    )
+
+    active_font = (
+        arabic_font
+        if is_arabic
+        else latin_font
+    )
+
+    # ========================================================
+    # OPTIONAL RTL / ARABIC SUPPORT
+    # ========================================================
+
+    rtl_supported = False
+
+    if is_arabic:
+
+        try:
+            import rlbidi  # noqa: F401
+
+            rtl_supported = True
+
+        except Exception:
+            rtl_supported = False
+
+    # ========================================================
+    # DOCUMENT
     # ========================================================
 
     buffer = BytesIO()
@@ -649,148 +722,337 @@ def generate_pdf(
     doc = SimpleDocTemplate(
         buffer,
         pagesize=letter,
-        rightMargin=40,
-        leftMargin=40,
-        topMargin=40,
-        bottomMargin=40,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm,
         title="THE ARMOR Research Report",
         author="THE ARMOR",
+        subject="Evidence-Grounded Theological Research & Apologetics",
     )
-
-    styles = getSampleStyleSheet()
 
     # ========================================================
     # STYLES
     # ========================================================
 
+    styles = getSampleStyleSheet()
+
+    if is_arabic and rtl_supported:
+
+        title_alignment = TA_RIGHT
+        subtitle_alignment = TA_RIGHT
+        query_alignment = TA_RIGHT
+        answer_alignment = TA_RIGHT
+        body_alignment = TA_RIGHT
+
+    elif is_arabic:
+
+        title_alignment = TA_RIGHT
+        subtitle_alignment = TA_RIGHT
+        query_alignment = TA_RIGHT
+        answer_alignment = TA_RIGHT
+        body_alignment = TA_RIGHT
+
+    else:
+
+        title_alignment = TA_CENTER
+        subtitle_alignment = TA_CENTER
+        query_alignment = TA_LEFT
+        answer_alignment = TA_LEFT
+        body_alignment = TA_LEFT
+
+    # --------------------------------------------------------
+    # Title
+    # --------------------------------------------------------
+
     title_style = ParagraphStyle(
-        "ReportTitle",
+        "ArmorReportTitle",
         parent=styles["Heading1"],
-        fontName=font_name,
+        fontName=active_font,
         fontSize=20,
-        leading=24,
+        leading=26,
+        alignment=title_alignment,
         textColor="#1e293b",
-        alignment=TA_CENTER,
-        spaceAfter=4,
+        spaceAfter=5,
     )
+
+    # --------------------------------------------------------
+    # Subtitle
+    # --------------------------------------------------------
 
     subtitle_style = ParagraphStyle(
-        "ReportSub",
+        "ArmorReportSubtitle",
         parent=styles["Normal"],
-        fontName=font_name,
-        fontSize=10,
+        fontName=active_font,
+        fontSize=9.5,
         leading=14,
+        alignment=subtitle_alignment,
         textColor="#64748b",
-        alignment=TA_CENTER,
-        spaceAfter=15,
+        spaceAfter=14,
     )
 
-    qa_query_style = ParagraphStyle(
-        "QAQuery",
+    # --------------------------------------------------------
+    # Query
+    # --------------------------------------------------------
+
+    query_style = ParagraphStyle(
+        "ArmorReportQuery",
         parent=styles["Heading2"],
-        fontName=font_name,
+        fontName=active_font,
         fontSize=11,
-        leading=15,
+        leading=16,
+        alignment=query_alignment,
         textColor="#1d4ed8",
         spaceBefore=12,
-        spaceAfter=4,
+        spaceAfter=5,
     )
 
-    qa_answer_style = ParagraphStyle(
-        "QAAnswer",
-        parent=styles["Normal"],
-        fontName=font_name,
-        fontSize=9.5,
-        leading=14,
-        textColor="#334155",
-        spaceAfter=10,
+    # --------------------------------------------------------
+    # Answer
+    # --------------------------------------------------------
+
+    answer_style_kwargs = {
+        "name": "ArmorReportAnswer",
+        "parent": styles["Normal"],
+        "fontName": active_font,
+        "fontSize": 9.5,
+        "leading": 15,
+        "alignment": answer_alignment,
+        "textColor": "#334155",
+        "spaceAfter": 10,
+    }
+
+    if is_arabic and rtl_supported:
+        answer_style_kwargs["wordWrap"] = "RTL"
+
+    answer_style = ParagraphStyle(
+        **answer_style_kwargs
     )
 
-    weakness_heading = ParagraphStyle(
-        "WeaknessHeading",
+    # --------------------------------------------------------
+    # Weakness heading
+    # --------------------------------------------------------
+
+    weakness_heading_style = ParagraphStyle(
+        "ArmorWeaknessHeading",
         parent=styles["Heading2"],
-        fontName=font_name,
+        fontName=active_font,
         fontSize=11,
-        leading=15,
+        leading=16,
+        alignment=query_alignment,
         textColor="#b91c1c",
         spaceBefore=12,
-        spaceAfter=4,
+        spaceAfter=5,
     )
+
+    # --------------------------------------------------------
+    # Body
+    # --------------------------------------------------------
+
+    body_style_kwargs = {
+        "name": "ArmorReportBody",
+        "parent": styles["Normal"],
+        "fontName": active_font,
+        "fontSize": 9.5,
+        "leading": 15,
+        "alignment": body_alignment,
+        "textColor": "#334155",
+        "spaceAfter": 7,
+    }
+
+    if is_arabic and rtl_supported:
+        body_style_kwargs["wordWrap"] = "RTL"
 
     body_style = ParagraphStyle(
-        "ReportBody",
-        parent=styles["Normal"],
-        fontName=font_name,
-        fontSize=9.5,
-        leading=14,
-        textColor="#334155",
-        spaceAfter=6,
+        **body_style_kwargs
     )
 
     # ========================================================
-    # HEADER
+    # HELPER: FORMAT TEXT SAFELY
     # ========================================================
 
-    story = [
-        Paragraph(
-            escape("THE ARMOR Research Report"),
-            title_style,
-        ),
+    def safe_paragraph_text(value) -> str:
+        """
+        Convert text into ReportLab-safe paragraph text.
 
-        Paragraph(
-            escape(
-                "Evidence-Grounded Theological Research & "
-                f"Apologetics — {language}"
-            ),
-            subtitle_style,
-        ),
+        HTML-sensitive characters are escaped while preserving
+        line breaks.
+        """
 
-        HRFlowable(
-            width="100%",
-            thickness=1,
-            color="#cbd5e1",
-            spaceAfter=15,
-        ),
-    ]
+        if value is None:
+            return ""
 
-    # ========================================================
-    # CONVERSATION
-    # ========================================================
+        text = str(value)
 
-    for turn in reversed(history):
+        # Normalize line endings.
+        text = text.replace("\r\n", "\n")
+        text = text.replace("\r", "\n")
 
-        query = escape(
-            str(turn.get("query", ""))
+        # Escape HTML/XML characters.
+        text = escape(
+            text,
+            quote=False,
         )
 
-        answer_text = escape(
-            str(turn.get("answer", ""))
+        # Preserve blank lines.
+        text = text.replace(
+            "\n\n",
+            "<br/><br/>",
         )
 
-        # Preserve line breaks.
-        answer_text = answer_text.replace(
+        # Preserve remaining line breaks.
+        text = text.replace(
             "\n",
             "<br/>",
         )
 
+        return text
+
+    # ========================================================
+    # HELPER: CREATE PARAGRAPH
+    # ========================================================
+
+    def make_paragraph(
+        text: str,
+        style,
+    ):
+        """
+        Create a Paragraph with Arabic RTL handling when
+        supported.
+        """
+
+        if is_arabic and rtl_supported:
+
+            try:
+                return Paragraph(
+                    text,
+                    style,
+                )
+
+            except Exception:
+                # Safe fallback.
+                return Paragraph(
+                    text,
+                    style,
+                )
+
+        return Paragraph(
+            text,
+            style,
+        )
+
+    # ========================================================
+    # STORY
+    # ========================================================
+
+    story = []
+
+    # --------------------------------------------------------
+    # TITLE
+    # --------------------------------------------------------
+
+    if is_arabic:
+
+        title_text = safe_paragraph_text(
+            "THE ARMOR — تقرير البحث"
+        )
+
+        subtitle_text = safe_paragraph_text(
+            f"البحث اللاهوتي المدعوم بالأدلة والدفاعيات المسيحية — {language}"
+        )
+
+    else:
+
+        title_text = safe_paragraph_text(
+            "THE ARMOR Research Report"
+        )
+
+        subtitle_text = safe_paragraph_text(
+            "Evidence-Grounded Theological Research & "
+            f"Apologetics — {language}"
+        )
+
+    story.append(
+        make_paragraph(
+            title_text,
+            title_style,
+        )
+    )
+
+    story.append(
+        make_paragraph(
+            subtitle_text,
+            subtitle_style,
+        )
+    )
+
+    story.append(
+        HRFlowable(
+            width="100%",
+            thickness=1,
+            color="#cbd5e1",
+            spaceAfter=12,
+        )
+    )
+
+    # ========================================================
+    # CONVERSATION HISTORY
+    # ========================================================
+
+    for turn in reversed(history):
+
+        query = safe_paragraph_text(
+            turn.get("query", "")
+        )
+
+        answer_text = safe_paragraph_text(
+            turn.get("answer", "")
+        )
+
+        # ----------------------------------------------------
+        # Query
+        # ----------------------------------------------------
+
+        if is_arabic:
+
+            query_label = "السؤال:"
+
+            answer_label = "الإجابة:"
+
+        else:
+
+            query_label = "Query:"
+
+            answer_label = "Answer:"
+
+        query_label = escape(
+            query_label,
+            quote=False,
+        )
+
+        answer_label = escape(
+            answer_label,
+            quote=False,
+        )
+
         story.append(
-            Paragraph(
-                f"<b>Query:</b> {query}",
-                qa_query_style,
+            make_paragraph(
+                f"<b>{query_label}</b> {query}",
+                query_style,
             )
         )
 
         story.append(
-            Paragraph(
-                f"<b>Answer:</b><br/>{answer_text}",
-                qa_answer_style,
+            make_paragraph(
+                f"<b>{answer_label}</b><br/>{answer_text}",
+                answer_style,
             )
         )
 
         story.append(
             Spacer(
                 1,
-                5,
+                4,
             )
         )
 
@@ -804,32 +1066,136 @@ def generate_pdf(
             HRFlowable(
                 width="100%",
                 thickness=0.5,
-                color="#f1f5f9",
-                spaceBefore=10,
+                color="#e2e8f0",
+                spaceBefore=8,
                 spaceAfter=10,
             )
         )
 
+        if is_arabic:
+
+            weakness_title = (
+                "المراجعة الجدلية / نقاط الضعف"
+            )
+
+        else:
+
+            weakness_title = (
+                "Adversarial Review / Weaknesses"
+            )
+
         story.append(
-            Paragraph(
-                escape(
-                    "Adversarial Review / Weaknesses"
+            make_paragraph(
+                safe_paragraph_text(
+                    weakness_title
                 ),
-                weakness_heading,
+                weakness_heading_style,
             )
         )
 
-        for wp in weakness_data.weakest_points:
+        # ----------------------------------------------------
+        # Weakest points
+        # ----------------------------------------------------
+
+        for wp in getattr(
+            weakness_data,
+            "weakest_points",
+            [],
+        ):
+
+            bullet = safe_paragraph_text(
+                str(wp)
+            )
 
             story.append(
-                Paragraph(
-                    f"• {escape(str(wp))}",
+                make_paragraph(
+                    f"• {bullet}",
                     body_style,
                 )
             )
 
+        # ----------------------------------------------------
+        # Defense strategy
+        # ----------------------------------------------------
+
+        defense_strategy = getattr(
+            weakness_data,
+            "defense_strategy",
+            [],
+        )
+
+        if defense_strategy:
+
+            if is_arabic:
+
+                defense_title = (
+                    "استراتيجية الدفاع"
+                )
+
+            else:
+
+                defense_title = (
+                    "Defense / Qualification Strategy"
+                )
+
+            story.append(
+                make_paragraph(
+                    f"<b>{safe_paragraph_text(defense_title)}</b>",
+                    body_style,
+                )
+            )
+
+            for item in defense_strategy:
+
+                story.append(
+                    make_paragraph(
+                        f"• {safe_paragraph_text(item)}",
+                        body_style,
+                    )
+                )
+
+        # ----------------------------------------------------
+        # Unsupported claims
+        # ----------------------------------------------------
+
+        unsupported_claims = getattr(
+            weakness_data,
+            "unsupported_claims",
+            [],
+        )
+
+        if unsupported_claims:
+
+            if is_arabic:
+
+                unsupported_title = (
+                    "الادعاءات غير المدعومة"
+                )
+
+            else:
+
+                unsupported_title = (
+                    "Unsupported Claims"
+                )
+
+            story.append(
+                make_paragraph(
+                    f"<b>{safe_paragraph_text(unsupported_title)}</b>",
+                    body_style,
+                )
+            )
+
+            for item in unsupported_claims:
+
+                story.append(
+                    make_paragraph(
+                        f"• {safe_paragraph_text(item)}",
+                        body_style,
+                    )
+                )
+
     # ========================================================
-    # BUILD
+    # BUILD PDF
     # ========================================================
 
     doc.build(story)
