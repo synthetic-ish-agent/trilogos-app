@@ -549,7 +549,7 @@ def _generate(
                     rotate_key_on_error()
 
                     # Small delay prevents immediate hammering.
-                    time.sleep(0.5)
+                    time.sleep(0.3)
 
                     continue
 
