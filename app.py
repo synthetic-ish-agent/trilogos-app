@@ -727,15 +727,6 @@ def generate_pdf(
 
     rtl_supported = False
 
-    if is_arabic:
-        try:
-            import rlbidi  # noqa: F401
-
-            rtl_supported = True
-
-        except Exception:
-            rtl_supported = False
-
     # ========================================================
     # DOCUMENT
     # ========================================================
