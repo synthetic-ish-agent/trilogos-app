@@ -230,6 +230,7 @@ def main():
         target_lang = st.selectbox(
             "Display / Translation Language",
             ["English", "French", "Arabic", "Hausa", "Igbo", "Yoruba"],
+            index=["English", "French", "Arabic", "Hausa", " igbo", "Yoruba"].index(st.session_state.get("setting_lang", "English")),
             key="setting_lang",
         )
 
