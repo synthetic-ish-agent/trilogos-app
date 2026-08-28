@@ -176,17 +176,60 @@ def init():
 # TRANSLATION
 # ============================================================
 
+def get_gemini_api_key() -> str | None:
+    """
+    Retrieve the Gemini API key.
+
+    Priority:
+    1. Streamlit secrets
+    2. GEMINI_API_KEY environment variable
+    3. GOOGLE_API_KEY environment variable
+    """
+
+    # --------------------------------------------------------
+    # Streamlit Cloud secrets
+    # --------------------------------------------------------
+
+    try:
+        key = st.secrets.get("GEMINI_API_KEY")
+
+        if key:
+            return str(key).strip()
+
+        key = st.secrets.get("GOOGLE_API_KEY")
+
+        if key:
+            return str(key).strip()
+
+    except Exception:
+        pass
+
+    # --------------------------------------------------------
+    # Environment variables
+    # --------------------------------------------------------
+
+    key = os.getenv("GEMINI_API_KEY")
+
+    if key:
+        return key.strip()
+
+    key = os.getenv("GOOGLE_API_KEY")
+
+    if key:
+        return key.strip()
+
+    return None
+
+
 def translate_text(
     text: str,
     target_lang: str,
 ) -> str:
     """
-    Translate an ORIGINAL English response into the selected
+    Translate the ORIGINAL English response into the selected
     language.
 
-    This function NEVER translates a previous translation.
-
-    English is returned unchanged.
+    The original English response is never modified.
     """
 
     if not text:
@@ -195,53 +238,56 @@ def translate_text(
     if target_lang == "English":
         return text
 
+    api_key = get_gemini_api_key()
+
+    if not api_key:
+        st.error(
+            "Translation failed: Gemini API key not found. "
+            "Add GEMINI_API_KEY to your Streamlit secrets."
+        )
+        return text
+
     try:
-        client = genai.Client()
+
+        client = genai.Client(
+            api_key=api_key
+        )
 
         prompt = f"""
-You are a highly accurate theological translator.
+Translate the following theological research response
+from English into {target_lang}.
 
-Translate the following theological research response from
-English into {target_lang}.
+RULES:
 
-IMPORTANT RULES:
-
-1. Translate the ENTIRE response.
-2. Do NOT summarize it.
-3. Do NOT shorten it.
-4. Do NOT add new information.
-5. Do NOT remove information.
-6. Preserve the exact meaning.
-7. Preserve Markdown formatting.
-8. Preserve headings.
-9. Preserve numbered lists.
-10. Preserve bullet points.
-11. Preserve Bible references.
-12. Preserve Quran references.
-13. Preserve citations and source references.
-14. Preserve names of people, places, books, historical events,
-    and theological concepts appropriately.
-15. Preserve quotations as faithfully as possible.
-16. Do not provide commentary about the translation.
-17. Return ONLY the translated response.
+- Translate the entire response.
+- Do not summarize.
+- Do not shorten.
+- Do not add information.
+- Do not remove information.
+- Preserve the exact meaning.
+- Preserve Markdown formatting.
+- Preserve headings.
+- Preserve numbered lists.
+- Preserve bullet points.
+- Preserve Bible references.
+- Preserve Quran references.
+- Preserve citations.
+- Preserve names and proper nouns.
+- Preserve theological terminology accurately.
+- Return ONLY the translated response.
 
 TARGET LANGUAGE:
 {target_lang}
 
-ORIGINAL ENGLISH RESPONSE:
+ORIGINAL RESPONSE:
 
 {text}
 """
 
         response = client.models.generate_content(
-            model=TRANSLATION_MODEL,
+            model="gemini-2.5-flash",
             contents=prompt,
         )
-
-        if not response:
-            raise RuntimeError(
-                "The translation model returned no response."
-            )
 
         translated = getattr(
             response,
@@ -251,19 +297,18 @@ ORIGINAL ENGLISH RESPONSE:
 
         if not translated:
             raise RuntimeError(
-                "The translation model returned empty text."
+                "Gemini returned an empty response."
             )
 
         return translated.strip()
 
     except Exception as exc:
-        # Do NOT silently hide translation failures.
+
         st.error(
             f"Translation to {target_lang} failed: {exc}"
         )
 
         return text
-
 
 def translate_history(
     history: list,
@@ -694,13 +739,8 @@ def render_header():
                     🛡️ THE ARMOR
                 </h1>
 
-                <p style="
-                    color: #94a3b8;
-                    font-size: 1rem;
-                    margin-top: 5px;
-                ">
-                    Evidence-grounded theological research,
-                    apologetics, and cross-examination
+                <p style="color: #94a3b8; font-size: 1rem; margin-top: 5px;">
+                    Evidence-grounded theological research, apologetics, and cross-examination
                 </p>
             </div>
             """,
