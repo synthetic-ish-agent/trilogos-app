@@ -156,7 +156,6 @@ def translate_text(text: str, target_lang: str) -> str:
         )
         return response.text
     except Exception as e:
-        st.warning(f"Translation failed: {e}")
         return text
     
 def init():
@@ -183,16 +182,17 @@ def init():
 def main():
     init()
 
-    current_lang = st.session_state.get("setting_lang", "English")
-    if current_lang != st.session_state.get("last_lang", "English"):
-        st.session_state.last_lang = current_lang
-        if st.session_state.history:
-            with st.spinner(f"Transleting conversation thread to {current_lang}..."):
-                for turn in st.session_state.history:
-                    turn["answer"] = translate_text(turn["answer"], current_lang)
-                if st.session_state.get("answer") and hasattr(st.session_state.answer, "answer"):
-                    st.session_state.answer.answer = translate_text(st.session_state.answer.answer, current_lang)
-            st.rerun()
+def on_language_change():
+    """Callback triggered instantly when the language selectbox changes."""
+    new_lang = st.session_state.setting_lang
+    old_lang = st.session_state.last_lang
+    if new_lang != old_lang and st.session_state.history:
+        with st.spinner(f"Transleting conversation thread to {new_lang}..."):
+            for turn in st.session_state.history:
+                turn["answer"] = translate_text(turn["answer"], new_lang)
+            if st.session_state.get("answer") and hasattr(st.session_state.answer, "answer"):
+                st.session_state.answer.answer = translate_text(st.session_state.answer.answer, new_lang)
+        st.rerun()
     
     # Centered Header Layout using columns and HTML/CSS
     _, center_col, _ = st.columns([1, 2, 1])
@@ -231,7 +231,8 @@ def main():
         target_lang = st.selectbox(
             "Display / Translation Language",
             ["English", "French", "Arabic", "Hausa", "Igbo", "Yoruba"],
-            key="setting_lang"
+            key="setting_lang",
+            on_change=on_language_change
         )
 
         selected_categories = st.multiselect(
