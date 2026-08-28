@@ -27,8 +27,14 @@ from google.genai.errors import APIError
 from lexicore.store import EvidenceStore
 from lexicore.store import DEFAULT_COLLECTION
 from lexicore.loaders import load_all
-from lexicore.llm import answer, assess, client, MODEL
-
+from lexicore.llm import (
+    answer,
+    assess,
+    get_available_keys,
+    get_next_client,
+    rotate_key_on_error,
+    MODEL,
+)
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -181,14 +187,23 @@ def translate_text(
     target_lang: str,
 ) -> str:
     """
-    Translate an ORIGINAL English response into the selected
-    display language.
+    Translate an existing English response into the selected language.
 
-    IMPORTANT:
-    This uses LexiCore's existing Gemini client, which means
-    translation uses the exact same API-key management,
-    Streamlit secrets, key rotation, timeout, and configuration
-    already used by answer().
+    Uses LexiCore's MULTI-KEY Gemini system.
+
+    If one API key receives a retryable error such as:
+        429 RESOURCE_EXHAUSTED
+        403
+        500
+        502
+        503
+        504
+        timeout
+
+    the function rotates to the next configured Google API key
+    and retries automatically.
+
+    This uses the same key pool as normal answer generation.
     """
 
     if not text:
@@ -198,17 +213,37 @@ def translate_text(
         return text
 
     try:
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # Use LexiCore's existing Gemini client.
-        #
-        # DO NOT create another genai.Client() here.
-        # ----------------------------------------------------
+        keys = get_available_keys()
 
-        ai_client = client()
+    except Exception as exc:
+        st.error(
+            f"Translation could not load Google API keys: {exc}"
+        )
+        return text
 
-        prompt = f"""
+    if not keys:
+        st.error(
+            "Translation could not find any configured "
+            "GOOGLE_API_KEY keys."
+        )
+        return text
+
+    # --------------------------------------------------------
+    # Number of attempts
+    #
+    # Use every configured key once, just like LexiCore's
+    # normal generation system.
+    # --------------------------------------------------------
+
+    attempts = len(keys)
+
+    last_error = None
+
+    # --------------------------------------------------------
+    # Translation prompt
+    # --------------------------------------------------------
+
+    prompt = f"""
 Translate the following theological research response
 from English into {target_lang}.
 
@@ -217,22 +252,22 @@ IMPORTANT RULES:
 - Translate the ENTIRE response.
 - Do NOT summarize it.
 - Do NOT shorten it.
-- Do NOT remove information.
+- Do NOT omit information.
 - Do NOT add information.
 - Preserve the exact meaning.
-- Preserve Markdown formatting.
-- Preserve headings.
-- Preserve paragraphs.
-- Preserve numbered lists if present.
-- Preserve bullet points if present.
+- Preserve all important theological terminology.
 - Preserve Bible references.
 - Preserve Quran references.
-- Preserve citations and evidence IDs.
-- Preserve names of people and places.
-- Preserve historical events.
-- Preserve theological terminology accurately.
+- Preserve historical names and places.
+- Preserve citations.
+- Preserve evidence IDs.
+- Preserve Markdown structure.
+- Preserve paragraphs.
+- Preserve headings.
+- Preserve numbered lists.
+- Preserve bullet points.
 - Do not change the argument.
-- Do not add theological commentary.
+- Do not introduce new theological claims.
 - Do not explain the translation.
 - Return ONLY the translated response.
 
@@ -245,31 +280,116 @@ ORIGINAL ENGLISH RESPONSE:
 {text}
 """
 
-        response = ai_client.models.generate_content(
-            model=MODEL,
-            contents=prompt,
-        )
+    # --------------------------------------------------------
+    # Try every configured key.
+    # --------------------------------------------------------
 
-        translated = getattr(
-            response,
-            "text",
-            None,
-        )
+    for attempt in range(attempts):
 
-        if not translated:
-            raise RuntimeError(
-                "Gemini returned an empty translation."
+        try:
+
+            ai_client = get_next_client()
+
+            response = ai_client.models.generate_content(
+                model=MODEL,
+                contents=prompt,
             )
 
-        return translated.strip()
+            translated = getattr(
+                response,
+                "text",
+                None,
+            )
 
-    except Exception as exc:
+            if not translated:
+                raise RuntimeError(
+                    "Gemini returned an empty translation."
+                )
 
-        st.error(
-            f"Translation to {target_lang} failed: {exc}"
-        )
+            return translated.strip()
 
-        return text
+        except Exception as exc:
+
+            last_error = exc
+
+            error_text = (
+                f"{type(exc).__name__}: {exc}"
+            ).lower()
+
+            # ------------------------------------------------
+            # Determine whether the failure is retryable.
+            # ------------------------------------------------
+
+            retryable = any(
+                marker in error_text
+                for marker in (
+                    "429",
+                    "resource_exhausted",
+                    "rate limit",
+                    "quota",
+                    "403",
+                    "permission_denied",
+                    "500",
+                    "502",
+                    "503",
+                    "504",
+                    "service unavailable",
+                    "timeout",
+                    "timed out",
+                    "connecterror",
+                    "connection reset",
+                    "connection aborted",
+                    "temporary failure",
+                    "getaddrinfo failed",
+                    "unexpected eof",
+                )
+            )
+
+            # ------------------------------------------------
+            # Non-retryable error.
+            # ------------------------------------------------
+
+            if not retryable:
+
+                st.error(
+                    f"Translation to {target_lang} failed: "
+                    f"{exc}"
+                )
+
+                return text
+
+            # ------------------------------------------------
+            # Retryable error.
+            #
+            # Rotate to the next configured key.
+            # ------------------------------------------------
+
+            if attempt < attempts - 1:
+
+                rotate_key_on_error()
+
+                # Small delay before retrying.
+                time.sleep(0.5)
+
+                continue
+
+            # ------------------------------------------------
+            # All keys exhausted.
+            # ------------------------------------------------
+
+            break
+
+    # --------------------------------------------------------
+    # All configured keys failed.
+    # --------------------------------------------------------
+
+    st.error(
+        f"Translation to {target_lang} failed after "
+        f"trying all {len(keys)} configured Google API keys.\n\n"
+        f"Last error: {last_error}"
+    )
+
+    return text
 
 def translate_history(
     history: list,
