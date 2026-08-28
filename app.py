@@ -27,7 +27,7 @@ from google.genai.errors import APIError
 from lexicore.store import EvidenceStore
 from lexicore.store import DEFAULT_COLLECTION
 from lexicore.loaders import load_all
-from lexicore.llm import answer, assess
+from lexicore.llm import answer, assess, client, MODEL
 
 
 # ============================================================
@@ -176,60 +176,19 @@ def init():
 # TRANSLATION
 # ============================================================
 
-def get_gemini_api_key() -> str | None:
-    """
-    Retrieve the Gemini API key.
-
-    Priority:
-    1. Streamlit secrets
-    2. GEMINI_API_KEY environment variable
-    3. GOOGLE_API_KEY environment variable
-    """
-
-    # --------------------------------------------------------
-    # Streamlit Cloud secrets
-    # --------------------------------------------------------
-
-    try:
-        key = st.secrets.get("GEMINI_API_KEY")
-
-        if key:
-            return str(key).strip()
-
-        key = st.secrets.get("GOOGLE_API_KEY")
-
-        if key:
-            return str(key).strip()
-
-    except Exception:
-        pass
-
-    # --------------------------------------------------------
-    # Environment variables
-    # --------------------------------------------------------
-
-    key = os.getenv("GEMINI_API_KEY")
-
-    if key:
-        return key.strip()
-
-    key = os.getenv("GOOGLE_API_KEY")
-
-    if key:
-        return key.strip()
-
-    return None
-
-
 def translate_text(
     text: str,
     target_lang: str,
 ) -> str:
     """
-    Translate the ORIGINAL English response into the selected
-    language.
+    Translate an ORIGINAL English response into the selected
+    display language.
 
-    The original English response is never modified.
+    IMPORTANT:
+    This uses LexiCore's existing Gemini client, which means
+    translation uses the exact same API-key management,
+    Streamlit secrets, key rotation, timeout, and configuration
+    already used by answer().
     """
 
     if not text:
@@ -238,54 +197,56 @@ def translate_text(
     if target_lang == "English":
         return text
 
-    api_key = get_gemini_api_key()
-
-    if not api_key:
-        st.error(
-            "Translation failed: Gemini API key not found. "
-            "Add GEMINI_API_KEY to your Streamlit secrets."
-        )
-        return text
-
     try:
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # Use LexiCore's existing Gemini client.
+        #
+        # DO NOT create another genai.Client() here.
+        # ----------------------------------------------------
 
-        client = genai.Client(
-            api_key=api_key
-        )
+        ai_client = client()
 
         prompt = f"""
 Translate the following theological research response
 from English into {target_lang}.
 
-RULES:
+IMPORTANT RULES:
 
-- Translate the entire response.
-- Do not summarize.
-- Do not shorten.
-- Do not add information.
-- Do not remove information.
+- Translate the ENTIRE response.
+- Do NOT summarize it.
+- Do NOT shorten it.
+- Do NOT remove information.
+- Do NOT add information.
 - Preserve the exact meaning.
 - Preserve Markdown formatting.
 - Preserve headings.
-- Preserve numbered lists.
-- Preserve bullet points.
+- Preserve paragraphs.
+- Preserve numbered lists if present.
+- Preserve bullet points if present.
 - Preserve Bible references.
 - Preserve Quran references.
-- Preserve citations.
-- Preserve names and proper nouns.
+- Preserve citations and evidence IDs.
+- Preserve names of people and places.
+- Preserve historical events.
 - Preserve theological terminology accurately.
+- Do not change the argument.
+- Do not add theological commentary.
+- Do not explain the translation.
 - Return ONLY the translated response.
 
 TARGET LANGUAGE:
+
 {target_lang}
 
-ORIGINAL RESPONSE:
+ORIGINAL ENGLISH RESPONSE:
 
 {text}
 """
 
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
+        response = ai_client.models.generate_content(
+            model=MODEL,
             contents=prompt,
         )
 
@@ -297,7 +258,7 @@ ORIGINAL RESPONSE:
 
         if not translated:
             raise RuntimeError(
-                "Gemini returned an empty response."
+                "Gemini returned an empty translation."
             )
 
         return translated.strip()
@@ -761,7 +722,6 @@ def render_sidebar():
             "Display / Translation Language",
             SUPPORTED_LANGUAGES,
             key="setting_lang",
-            on_change=on_language_change,
         )
 
         # ----------------------------------------------------
@@ -1183,9 +1143,7 @@ selects another language.
         # This does NOT modify the original English history.
         # ----------------------------------------------------
 
-        display_history = get_display_history(
-            target_lang
-        )
+        display_history = get_display_history(target_lang)
 
         # ----------------------------------------------------
         # PDF
