@@ -62,7 +62,7 @@ COLLECTION = os.getenv(
     "lexicore_evidence_v3",
 )
 
-TRANSLATION_MODEL = "gemini-2.5-flash"
+TRANSLATION_MODEL = "gemini-3.6-flash"
 
 SUPPORTED_LANGUAGES = [
     "English",
@@ -285,7 +285,7 @@ ORIGINAL RESPONSE:
 """
 
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=prompt,
         )
 
@@ -715,36 +715,17 @@ def generate_pdf(
 # ============================================================
 
 def render_header():
-
-    _, center_col, _ = st.columns(
-        [1, 2, 1]
-    )
+    _, center_col, _ = st.columns([1, 2, 1])
 
     with center_col:
-
         st.markdown(
-            """
-            <div style="
-                text-align: center;
-                margin-bottom: 20px;
-            ">
-                <h1 style="
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    gap: 10px;
-                    font-size: 2.5rem;
-                    margin-bottom: 0px;
-                ">
-                    🛡️ THE ARMOR
-                </h1>
-
-                <p style="color: #94a3b8; font-size: 1rem; margin-top: 5px;">
-                    Evidence-grounded theological research, apologetics, and cross-examination
-                </p>
-            </div>
-            """,
+            "<h1 style='text-align:center;'>🛡️ THE ARMOR</h1>",
             unsafe_allow_html=True,
+        )
+
+        st.caption(
+            "Evidence-grounded theological research, "
+            "apologetics, and cross-examination"
         )
 
 
