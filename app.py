@@ -228,10 +228,13 @@ def main():
             key="setting_stance"
         )
 
+        languages = ["English", "French", "Arabic", "Hausa", "Igbo", "Yoruba"]
+        current_lang_idx = languages.index(st.session_state.get("setting_lang", "English"))
+
         target_lang = st.selectbox(
             "Display / Translation Language",
-            ["English", "French", "Arabic", "Hausa", "Igbo", "Yoruba"],
-            index=["English", "French", "Arabic", "Hausa", " Igbo", "Yoruba"],
+            languages,
+            index=current_lang_idx,
             key="setting_lang",
             on_change=on_language_change
         )
