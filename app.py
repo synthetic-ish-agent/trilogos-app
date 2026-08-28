@@ -1,3 +1,4 @@
+```python
 from __future__ import annotations
 
 import os
@@ -9,33 +10,24 @@ from copy import deepcopy
 
 import streamlit as st
 
-from reportlab.lib.pagesizes import letter
+from reportlab.lib.enums import TA_CENTER
 from reportlab.platypus import (
+    HRFlowable,
     SimpleDocTemplate,
     Paragraph,
     Spacer,
-    HRFlowable,
 )
-from reportlab.lib.styles import (
-    getSampleStyleSheet,
-    ParagraphStyle,
-)
-from reportlab.lib.enums import (
-    TA_CENTER,
-    TA_LEFT,
-    TA_RIGHT,
-)
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from xml.sax.saxutils import escape
 
+from google import genai
 from google.genai.errors import APIError
 
-from lexicore.store import (
-    EvidenceStore,
-    DEFAULT_COLLECTION,
-)
+from lexicore.store import EvidenceStore
+from lexicore.store import DEFAULT_COLLECTION
 from lexicore.loaders import load_all
-
 from lexicore.llm import (
     answer,
     assess,
@@ -44,6 +36,8 @@ from lexicore.llm import (
     rotate_key_on_error,
     MODEL,
 )
+
+from html import escape
 
 
 # ============================================================
@@ -77,13 +71,10 @@ DB = os.getenv(
 
 COLLECTION = os.getenv(
     "LEXICORE_COLLECTION",
-    DEFAULT_COLLECTION,
+    "lexicore_evidence_v3",
 )
 
-TRANSLATION_MODEL = os.getenv(
-    "LEXICORE_TRANSLATION_MODEL",
-    MODEL,
-)
+TRANSLATION_MODEL = "gemini-3.6-flash"
 
 SUPPORTED_LANGUAGES = [
     "English",
@@ -94,13 +85,6 @@ SUPPORTED_LANGUAGES = [
     "Yoruba",
 ]
 
-MAX_TRANSLATION_CHARS = int(
-    os.getenv(
-        "LEXICORE_MAX_TRANSLATION_CHARS",
-        "24000",
-    )
-)
-
 
 # ============================================================
 # EVIDENCE STORE
@@ -110,34 +94,35 @@ MAX_TRANSLATION_CHARS = int(
     show_spinner="Initializing canonical evidence index..."
 )
 def get_store():
+    """
+    Open or create the canonical evidence store.
+
+    The store is cached because rebuilding/opening the database
+    on every Streamlit rerun would be unnecessarily expensive.
+    """
 
     db_path = Path(DB)
-
     db_path.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     try:
-
         store = EvidenceStore.open_or_create(
             DB,
             COLLECTION,
         )
-
     except Exception:
-
         store = EvidenceStore(
             DB,
             COLLECTION,
         )
 
+    # Automatically ingest evidence if the collection is empty.
     if store.count() == 0:
-
         data_path = Path("./data")
 
         if data_path.exists():
-
             records = load_all(
                 data_path,
                 include_poc=True,
@@ -154,59 +139,52 @@ def get_store():
 # ============================================================
 
 def init():
+    """
+    Initialize all Streamlit session state values.
+
+    Important:
+    - history stores the ORIGINAL English responses.
+    - translation_cache stores translated display versions.
+    """
 
     defaults = {
-
         "hits": [],
-
         "query": "",
-
         "answer": None,
-
         "weakness": None,
-
-        "run_id": uuid.uuid4().hex,
+        "run_id": str(uuid.uuid4().hex),
 
         "history": [],
-
         "sessions": {},
-
         "active_session_id": None,
 
-        "setting_stance":
-            "Didactic/Explanatory",
-
+        "setting_stance": "Didactic/Explanatory",
         "setting_categories": [],
-
         "setting_n": 15,
-
         "setting_temp": 0.2,
-
         "setting_lang": "English",
-
         "last_lang": "English",
 
-        # language -> translated history
-        "translation_cache": {},
-
-        # Tracks how many canonical turns were already
-        # translated for each language.
+        # ----------------------------------------------------
+        # Translation cache
         #
         # {
-        #   "Igbo": 3
+        #     "French": [
+        #         {
+        #             "query": "...",
+        #             "answer": "..."
+        #         }
+        #     ],
+        #     "Hausa": [...]
         # }
-        "translation_counts": {},
+        # ----------------------------------------------------
+
+        "translation_cache": {},
 
         "elapsed": 0.0,
-
-        # Cache PDF bytes so Streamlit reruns don't rebuild it.
-        "pdf_cache": None,
-
-        "pdf_cache_key": None,
     }
 
     for key, value in defaults.items():
-
         st.session_state.setdefault(
             key,
             value,
@@ -217,426 +195,18 @@ def init():
 # TRANSLATION
 # ============================================================
 
-def _translation_keys():
-
-    try:
-        return get_available_keys()
-
-    except Exception:
-        return []
-
-
-def _translation_error_is_retryable(
-    exc: Exception,
-) -> bool:
-
-    text = (
-        f"{type(exc).__name__}: {exc}"
-    ).lower()
-
-    return any(
-        marker in text
-        for marker in (
-            "429",
-            "resource_exhausted",
-            "rate limit",
-            "quota",
-            "403",
-            "permission_denied",
-            "500",
-            "502",
-            "503",
-            "504",
-            "service unavailable",
-            "timeout",
-            "timed out",
-            "connection reset",
-            "connection aborted",
-            "connecterror",
-            "unexpected eof",
-        )
-    )
-
-
-def _clip_translation_input(
-    text: str,
-) -> str:
-
-    if len(text) <= MAX_TRANSLATION_CHARS:
-        return text
-
-    return (
-        text[:MAX_TRANSLATION_CHARS]
-        + "\n\n[Remaining text omitted for translation efficiency.]"
-    )
-
-
-def _translate_batch(
-    turns: list,
-    target_lang: str,
-) -> list:
-
-    """
-    Translate ALL supplied turns in ONE Gemini request.
-
-    This is the major speed improvement over the old implementation.
-    """
-
-    if not turns:
-        return []
-
-    if target_lang == "English":
-
-        return deepcopy(turns)
-
-    keys = _translation_keys()
-
-    if not keys:
-
-        return deepcopy(turns)
-
-    blocks = []
-
-    for index, turn in enumerate(
-        turns,
-        start=1,
-    ):
-
-        original = turn.get(
-            "original_answer",
-            turn.get(
-                "answer",
-                "",
-            ),
-        )
-
-        blocks.append(
-            f"""
-TURN {index}
-
-QUERY:
-{turn.get("query", "")}
-
-ANSWER:
-{original}
-""".strip()
-        )
-
-    conversation_text = "\n\n==========\n\n".join(
-        blocks
-    )
-
-    conversation_text = _clip_translation_input(
-        conversation_text
-    )
-
-    prompt = f"""
-Translate the following THE ARMOR theological research
-conversation from English into {target_lang}.
-
-This is a TRANSLATION task, not a summarization task.
-
-Rules:
-
-- Translate every supplied turn.
-- Do not omit information.
-- Do not summarize.
-- Do not add information.
-- Preserve the exact meaning.
-- Preserve Bible references.
-- Preserve Quran references.
-- Preserve historical names.
-- Preserve citations.
-- Preserve evidence IDs.
-- Preserve Markdown.
-- Preserve headings.
-- Preserve numbered lists.
-- Preserve bullet points.
-- Preserve paragraph structure.
-- Do not alter the argument.
-- Do not explain the translation.
-
-Return ONLY the translated conversation.
-
-Use exactly this structure:
-
-TURN 1
-QUERY:
-...
-ANSWER:
-...
-
-TURN 2
-QUERY:
-...
-ANSWER:
-...
-
-and so on.
-
-TARGET LANGUAGE:
-{target_lang}
-
-CONVERSATION:
-
-{conversation_text}
-"""
-
-    last_error = None
-
-    for _ in range(
-        len(keys)
-    ):
-
-        try:
-
-            client = get_next_client()
-
-            response = client.models.generate_content(
-                model=TRANSLATION_MODEL,
-                contents=prompt,
-                config={
-                    "temperature": 0.1,
-                    "max_output_tokens": 7000,
-                },
-            )
-
-            raw = getattr(
-                response,
-                "text",
-                None,
-            )
-
-            if not raw:
-
-                raise RuntimeError(
-                    "Empty translation response."
-                )
-
-            return _parse_translated_turns(
-                raw,
-                turns,
-            )
-
-        except Exception as exc:
-
-            last_error = exc
-
-            if not _translation_error_is_retryable(
-                exc
-            ):
-                break
-
-            rotate_key_on_error()
-
-            # IMPORTANT:
-            # No artificial sleep.
-            # The llm layer handles key cooldown.
-            continue
-
-    # Silent failure:
-    # Return original English instead of exposing API
-    # errors or key numbers to the user.
-    return deepcopy(turns)
-
-
-def _parse_translated_turns(
-    text: str,
-    original_turns: list,
-) -> list:
-
-    """
-    Parse the structured translation response.
-
-    If parsing is imperfect, retain the original query and
-    fall back to the original answer for the affected turn.
-    """
-
-    result = []
-
-    blocks = []
-
-    current = []
-
-    for line in text.splitlines():
-
-        stripped = line.strip()
-
-        if stripped.upper().startswith(
-            "TURN "
-        ) and current:
-
-            blocks.append(
-                "\n".join(current)
-            )
-
-            current = [
-                line
-            ]
-
-        else:
-
-            current.append(line)
-
-    if current:
-        blocks.append(
-            "\n".join(current)
-        )
-
-    # Remove accidental preamble.
-    cleaned_blocks = []
-
-    for block in blocks:
-
-        if "QUERY:" in block.upper():
-
-            cleaned_blocks.append(
-                block
-            )
-
-    if not cleaned_blocks:
-
-        return deepcopy(
-            original_turns
-        )
-
-    for index, original in enumerate(
-        original_turns
-    ):
-
-        if index >= len(
-            cleaned_blocks
-        ):
-
-            result.append(
-                {
-                    "query":
-                        original.get(
-                            "query",
-                            "",
-                        ),
-                    "answer":
-                        original.get(
-                            "original_answer",
-                            original.get(
-                                "answer",
-                                "",
-                            ),
-                        ),
-                    "original_answer":
-                        original.get(
-                            "original_answer",
-                            original.get(
-                                "answer",
-                                "",
-                            ),
-                        ),
-                }
-            )
-
-            continue
-
-        block = cleaned_blocks[index]
-
-        query_pos = block.upper().find(
-            "QUERY:"
-        )
-
-        answer_pos = block.upper().find(
-            "ANSWER:"
-        )
-
-        if (
-            query_pos == -1
-            or answer_pos == -1
-            or answer_pos <= query_pos
-        ):
-
-            result.append(
-                {
-                    "query":
-                        original.get(
-                            "query",
-                            "",
-                        ),
-                    "answer":
-                        original.get(
-                            "original_answer",
-                            original.get(
-                                "answer",
-                                "",
-                            ),
-                        ),
-                    "original_answer":
-                        original.get(
-                            "original_answer",
-                            original.get(
-                                "answer",
-                                "",
-                            ),
-                        ),
-                }
-            )
-
-            continue
-
-        translated_query = block[
-            query_pos
-            + len("QUERY:"):
-            answer_pos
-        ].strip()
-
-        translated_answer = block[
-            answer_pos
-            + len("ANSWER:"):
-        ].strip()
-
-        if not translated_answer:
-
-            translated_answer = original.get(
-                "original_answer",
-                original.get(
-                    "answer",
-                    "",
-                ),
-            )
-
-        result.append(
-            {
-                "query":
-                    translated_query
-                    or original.get(
-                        "query",
-                        "",
-                    ),
-
-                "answer":
-                    translated_answer,
-
-                "original_answer":
-                    original.get(
-                        "original_answer",
-                        original.get(
-                            "answer",
-                            "",
-                        ),
-                    ),
-            }
-        )
-
-    return result
-
-
 def translate_text(
     text: str,
     target_lang: str,
 ) -> str:
-
     """
-    Compatibility wrapper.
+    Translate an existing English response into the selected
+    language.
 
-    For a single response this still makes one request,
-    but normal application flow uses _translate_batch().
+    Uses LexiCore's multi-key Gemini system.
+
+    API failures and key rotation are intentionally hidden
+    from the user interface.
     """
 
     if not text:
@@ -645,25 +215,128 @@ def translate_text(
     if target_lang == "English":
         return text
 
-    turns = [
-        {
-            "query": "",
-            "answer": text,
-            "original_answer": text,
-        }
-    ]
+    try:
+        keys = get_available_keys()
+    except Exception:
+        # Keep API configuration errors out of the UI.
+        return text
 
-    translated = _translate_batch(
-        turns,
-        target_lang,
-    )
+    if not keys:
+        return text
 
-    if translated:
+    prompt = f"""
+Translate the following theological research response from
+English into {target_lang}.
 
-        return translated[0].get(
-            "answer",
-            text,
-        )
+IMPORTANT RULES:
+
+- Translate the ENTIRE response.
+- Do NOT summarize it.
+- Do NOT shorten it.
+- Do NOT omit information.
+- Do NOT add information.
+- Preserve the exact meaning.
+- Preserve theological terminology accurately.
+- Preserve Bible references.
+- Preserve Quran references.
+- Preserve historical names and places.
+- Preserve citations.
+- Preserve evidence IDs.
+- Preserve Markdown structure.
+- Preserve paragraphs.
+- Preserve headings.
+- Preserve numbered lists.
+- Preserve bullet points.
+- Do not change the argument.
+- Do not introduce new theological claims.
+- Do not explain the translation.
+- Return ONLY the translated response.
+
+TARGET LANGUAGE:
+{target_lang}
+
+ORIGINAL ENGLISH RESPONSE:
+{text}
+"""
+
+    attempts = len(keys)
+    last_error = None
+
+    for attempt in range(attempts):
+        try:
+            ai_client = get_next_client()
+
+            response = ai_client.models.generate_content(
+                model=MODEL,
+                contents=prompt,
+            )
+
+            translated = getattr(
+                response,
+                "text",
+                None,
+            )
+
+            if translated:
+                return translated.strip()
+
+            last_error = RuntimeError(
+                "Empty translation response."
+            )
+
+        except Exception as exc:
+            last_error = exc
+
+            error_text = (
+                f"{type(exc).__name__}: {exc}"
+            ).lower()
+
+            retryable = any(
+                marker in error_text
+                for marker in (
+                    "429",
+                    "resource_exhausted",
+                    "rate limit",
+                    "quota",
+                    "403",
+                    "permission_denied",
+                    "500",
+                    "502",
+                    "503",
+                    "504",
+                    "service unavailable",
+                    "timeout",
+                    "timed out",
+                    "connecterror",
+                    "connection reset",
+                    "connection aborted",
+                    "temporary failure",
+                    "getaddrinfo failed",
+                    "unexpected eof",
+                )
+            )
+
+            if not retryable:
+                break
+
+            if attempt < attempts - 1:
+                # Silent key rotation.
+                rotate_key_on_error()
+                time.sleep(0.5)
+                continue
+
+            break
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Do NOT display the API error.
+    # Do NOT display the key number.
+    # Do NOT display quota information.
+    # Do NOT display the exception.
+    #
+    # Simply return the original text.
+    # --------------------------------------------------------
 
     return text
 
@@ -672,26 +345,60 @@ def translate_history(
     history: list,
     target_lang: str,
 ) -> list:
+    """
+    Translate an entire conversation from the ORIGINAL
+    English responses.
 
-    if not history:
-        return []
+    The returned list is for display only.
+    The original history is never modified.
+    """
 
     if target_lang == "English":
         return deepcopy(history)
 
-    return _translate_batch(
-        history,
-        target_lang,
-    )
+    translated_history = []
 
+    for turn in history:
 
-# ============================================================
-# DISPLAY TRANSLATION CACHE
-# ============================================================
+        # New format stores original_answer.
+        #
+        # The fallback is useful for conversations created by
+        # older versions of the application.
+
+        original_answer = turn.get(
+            "original_answer",
+            turn.get("answer", ""),
+        )
+
+        translated_answer = translate_text(
+            original_answer,
+            target_lang,
+        )
+
+        translated_history.append(
+            {
+                "query": turn.get(
+                    "query",
+                    "",
+                ),
+                "answer": translated_answer,
+                "original_answer": original_answer,
+            }
+        )
+
+    return translated_history
+
 
 def get_display_history(
     target_lang: str,
 ) -> list:
+    """
+    Return the conversation in the currently selected language.
+
+    English uses the original history.
+
+    Other languages use the translation cache.
+    """
 
     history = st.session_state.get(
         "history",
@@ -704,136 +411,92 @@ def get_display_history(
     if target_lang == "English":
         return history
 
-    cache = st.session_state.translation_cache
-
-    cached = cache.get(
+    cached = st.session_state.translation_cache.get(
         target_lang
     )
 
-    translated_count = st.session_state.translation_counts.get(
-        target_lang,
-        0,
-    )
-
-    current_count = len(history)
-
-    # Nothing changed.
-    if (
-        cached is not None
-        and translated_count
-        == current_count
-    ):
-
+    if cached is not None:
         return cached
 
-    # First translation for this language.
-    if cached is None:
+    # Translation is performed only when this language has not
+    # already been translated.
 
-        translated = translate_history(
-            history,
-            target_lang,
-        )
-
-        cache[target_lang] = translated
-
-        st.session_state.translation_counts[
-            target_lang
-        ] = len(history)
-
-        return translated
-
-    # --------------------------------------------------------
-    # A new canonical answer was added.
-    #
-    # Translate ONLY the new turns.
-    # --------------------------------------------------------
-
-    if current_count > translated_count:
-
-        new_turns = history[
-            translated_count:
-        ]
-
-        new_translations = _translate_batch(
-            new_turns,
-            target_lang,
-        )
-
-        cache[target_lang] = (
-            cached
-            + new_translations
-        )
-
-        st.session_state.translation_counts[
-            target_lang
-        ] = current_count
-
-        return cache[target_lang]
-
-    # Defensive fallback.
     translated = translate_history(
         history,
         target_lang,
     )
 
-    cache[target_lang] = translated
-
-    st.session_state.translation_counts[
-        target_lang
-    ] = current_count
+    st.session_state.translation_cache[target_lang] = (
+        translated
+    )
 
     return translated
 
 
 def on_language_change():
+    """
+    Called when the language selectbox changes.
 
-    new_lang = (
-        st.session_state.setting_lang
-    )
+    IMPORTANT:
+    This does NOT modify the original English conversation.
 
-    old_lang = (
-        st.session_state.last_lang
-    )
+    It creates/loads a translation cache instead.
+    """
+
+    new_lang = st.session_state.setting_lang
+    old_lang = st.session_state.last_lang
 
     if new_lang == old_lang:
         return
 
-    st.session_state.last_lang = (
-        new_lang
-    )
+    st.session_state.last_lang = new_lang
 
-    # English requires no API call.
-    if new_lang == "English":
-        return
-
+    # Nothing to translate if there is no conversation yet.
     if not st.session_state.history:
         return
 
-    # Translation is intentionally lazy.
-    #
-    # We do NOT translate here.
-    #
-    # get_display_history() performs it only when the
-    # conversation is actually rendered.
-    return
+    # English is already the canonical language.
+    if new_lang == "English":
+        return
+
+    # If this language was already translated, do nothing.
+    if new_lang in st.session_state.translation_cache:
+        return
+
+    with st.spinner(
+        f"Translating conversation to {new_lang}..."
+    ):
+        translated = translate_history(
+            st.session_state.history,
+            new_lang,
+        )
+
+        st.session_state.translation_cache[new_lang] = (
+            translated
+        )
 
 
 # ============================================================
-# SESSION MANAGEMENT
+# SESSION / CONVERSATION MANAGEMENT
 # ============================================================
 
 def clear_translation_cache():
+    """
+    Remove all cached translations.
+
+    This should happen whenever the underlying conversation
+    changes.
+    """
 
     st.session_state.translation_cache = {}
 
-    st.session_state.translation_counts = {}
-
-    st.session_state.pdf_cache = None
-
-    st.session_state.pdf_cache_key = None
-
 
 def save_current_session():
+    """
+    Save the current conversation thread.
+
+    Sessions always store the ORIGINAL English history.
+    """
 
     history = st.session_state.get(
         "history",
@@ -844,55 +507,39 @@ def save_current_session():
         return
 
     if not st.session_state.active_session_id:
-
         st.session_state.active_session_id = (
-            uuid.uuid4().hex
+            str(uuid.uuid4().hex)
         )
 
-    session_id = (
-        st.session_state.active_session_id
-    )
+    session_id = st.session_state.active_session_id
 
     title = (
         history[0]
-        .get(
-            "query",
-            "Research",
-        )
+        .get("query", "Research")
         .strip()
     )
 
     if len(title) > 30:
+        title = title[:30] + "..."
 
-        title = (
-            title[:30]
-            + "..."
-        )
-
-    st.session_state.sessions[
-        session_id
-    ] = {
+    st.session_state.sessions[session_id] = {
         "title": title,
-        "history": deepcopy(
-            history
-        ),
+        "history": deepcopy(history),
     }
 
 
 def start_new_thread():
+    """
+    Start a completely new research thread.
+    """
 
     save_current_session()
 
     st.session_state.history = []
-
     st.session_state.answer = None
-
     st.session_state.weakness = None
-
     st.session_state.hits = []
-
     st.session_state.query = ""
-
     st.session_state.active_session_id = None
 
     clear_translation_cache()
@@ -901,11 +548,12 @@ def start_new_thread():
 def load_session(
     session_id: str,
 ):
+    """
+    Load an existing saved conversation.
+    """
 
-    session = (
-        st.session_state.sessions.get(
-            session_id
-        )
+    session = st.session_state.sessions.get(
+        session_id
     )
 
     if not session:
@@ -918,23 +566,17 @@ def load_session(
         )
     )
 
-    st.session_state.active_session_id = (
-        session_id
-    )
-
+    st.session_state.active_session_id = session_id
     st.session_state.answer = None
-
     st.session_state.weakness = None
-
     st.session_state.hits = []
-
     st.session_state.query = ""
 
     clear_translation_cache()
 
 
 # ============================================================
-# PDF
+# PDF GENERATION
 # ============================================================
 
 def generate_pdf(
@@ -942,99 +584,336 @@ def generate_pdf(
     weakness_data=None,
     language: str = "English",
 ) -> bytes:
+    """
+    Generate a Unicode-safe THE ARMOR research PDF.
+
+    Supported languages:
+    English
+    French
+    Hausa
+    Igbo
+    Yoruba
+    Arabic
+
+    Font strategy:
+    - DejaVu Sans for Latin-based languages
+    - Noto Naskh Arabic for Arabic
+
+    Arabic:
+    - Uses ReportLab's RTL paragraph support when available.
+    - Uses shaping/bidi support when available.
+    - Falls back safely if optional RTL support is unavailable.
+
+    IMPORTANT:
+    The actual font files must exist in:
+
+        fonts/DejaVuSans.ttf
+        fonts/NotoNaskhArabic-Regular.ttf
+    """
+
+    from pathlib import Path
+    from io import BytesIO
+
+    from reportlab.lib.enums import (
+        TA_CENTER,
+        TA_RIGHT,
+        TA_LEFT,
+    )
+
+    from reportlab.lib.pagesizes import letter
+
+    from reportlab.lib.styles import (
+        getSampleStyleSheet,
+        ParagraphStyle,
+    )
+
+    from reportlab.lib.units import mm
+
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    from reportlab.platypus import (
+        SimpleDocTemplate,
+        Paragraph,
+        Spacer,
+        HRFlowable,
+    )
+
+    # ========================================================
+    # FONT PATHS
+    # ========================================================
+
+    base_dir = Path(__file__).resolve().parent
+
+    fonts_dir = base_dir / "fonts"
+
+    latin_font_path = (
+        fonts_dir / "DejaVuSans.ttf"
+    )
+
+    arabic_font_path = (
+        fonts_dir / "NotoNaskhArabic-Regular.ttf"
+    )
+
+    # ========================================================
+    # REGISTER LATIN FONT
+    # ========================================================
+
+    latin_font = "Helvetica"
+
+    if latin_font_path.exists():
+        try:
+            if (
+                "ArmorDejaVu"
+                not in pdfmetrics.getRegisteredFontNames()
+            ):
+                pdfmetrics.registerFont(
+                    TTFont(
+                        "ArmorDejaVu",
+                        str(latin_font_path),
+                    )
+                )
+
+            latin_font = "ArmorDejaVu"
+
+        except Exception:
+            latin_font = "Helvetica"
+
+    # ========================================================
+    # REGISTER ARABIC FONT
+    # ========================================================
+
+    arabic_font = latin_font
+
+    if arabic_font_path.exists():
+        try:
+            if (
+                "ArmorArabic"
+                not in pdfmetrics.getRegisteredFontNames()
+            ):
+                pdfmetrics.registerFont(
+                    TTFont(
+                        "ArmorArabic",
+                        str(arabic_font_path),
+                    )
+                )
+
+            arabic_font = "ArmorArabic"
+
+        except Exception:
+            arabic_font = latin_font
+
+    # ========================================================
+    # DETERMINE WHETHER THIS IS ARABIC
+    # ========================================================
+
+    is_arabic = (
+        str(language).strip().lower()
+        in {
+            "arabic",
+            "العربية",
+            "عربي",
+        }
+    )
+
+    active_font = (
+        arabic_font
+        if is_arabic
+        else latin_font
+    )
+
+    # ========================================================
+    # OPTIONAL RTL / ARABIC SUPPORT
+    # ========================================================
+
+    rtl_supported = False
+
+    if is_arabic:
+        try:
+            import rlbidi  # noqa: F401
+
+            rtl_supported = True
+
+        except Exception:
+            rtl_supported = False
+
+    # ========================================================
+    # DOCUMENT
+    # ========================================================
 
     buffer = BytesIO()
 
     doc = SimpleDocTemplate(
         buffer,
         pagesize=letter,
-        rightMargin=40,
-        leftMargin=40,
-        topMargin=40,
-        bottomMargin=40,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm,
         title="THE ARMOR Research Report",
         author="THE ARMOR",
+        subject=(
+            "Evidence-Grounded Theological "
+            "Research & Apologetics"
+        ),
     )
+
+    # ========================================================
+    # STYLES
+    # ========================================================
 
     styles = getSampleStyleSheet()
 
-    is_arabic = (
-        str(language).lower()
-        == "arabic"
-    )
+    if is_arabic and rtl_supported:
 
-    alignment = (
-        TA_RIGHT
-        if is_arabic
-        else TA_LEFT
-    )
+        title_alignment = TA_RIGHT
+        subtitle_alignment = TA_RIGHT
+        query_alignment = TA_RIGHT
+        answer_alignment = TA_RIGHT
+        body_alignment = TA_RIGHT
 
-    title_alignment = (
-        TA_RIGHT
-        if is_arabic
-        else TA_CENTER
-    )
+    elif is_arabic:
+
+        title_alignment = TA_RIGHT
+        subtitle_alignment = TA_RIGHT
+        query_alignment = TA_RIGHT
+        answer_alignment = TA_RIGHT
+        body_alignment = TA_RIGHT
+
+    else:
+
+        title_alignment = TA_CENTER
+        subtitle_alignment = TA_CENTER
+        query_alignment = TA_LEFT
+        answer_alignment = TA_LEFT
+        body_alignment = TA_LEFT
+
+    # --------------------------------------------------------
+    # Title
+    # --------------------------------------------------------
 
     title_style = ParagraphStyle(
-        "ArmorTitle",
+        "ArmorReportTitle",
         parent=styles["Heading1"],
-        fontSize=18,
-        leading=23,
+        fontName=active_font,
+        fontSize=20,
+        leading=26,
         alignment=title_alignment,
         textColor="#1e293b",
         spaceAfter=5,
     )
 
+    # --------------------------------------------------------
+    # Subtitle
+    # --------------------------------------------------------
+
     subtitle_style = ParagraphStyle(
-        "ArmorSubtitle",
+        "ArmorReportSubtitle",
         parent=styles["Normal"],
+        fontName=active_font,
         fontSize=9.5,
         leading=14,
-        alignment=title_alignment,
+        alignment=subtitle_alignment,
         textColor="#64748b",
-        spaceAfter=15,
+        spaceAfter=14,
     )
+
+    # --------------------------------------------------------
+    # Query
+    # --------------------------------------------------------
 
     query_style = ParagraphStyle(
-        "ArmorQuery",
+        "ArmorReportQuery",
         parent=styles["Heading2"],
+        fontName=active_font,
         fontSize=11,
-        leading=15,
-        alignment=alignment,
+        leading=16,
+        alignment=query_alignment,
         textColor="#1d4ed8",
-        spaceBefore=10,
-        spaceAfter=4,
+        spaceBefore=12,
+        spaceAfter=5,
     )
 
-    body_style = ParagraphStyle(
-        "ArmorBody",
-        parent=styles["Normal"],
-        fontSize=9.5,
-        leading=14,
-        alignment=alignment,
-        textColor="#334155",
-        spaceAfter=8,
+    # --------------------------------------------------------
+    # Answer
+    # --------------------------------------------------------
+
+    answer_style_kwargs = {
+        "name": "ArmorReportAnswer",
+        "parent": styles["Normal"],
+        "fontName": active_font,
+        "fontSize": 9.5,
+        "leading": 15,
+        "alignment": answer_alignment,
+        "textColor": "#334155",
+        "spaceAfter": 10,
+    }
+
+    if is_arabic and rtl_supported:
+        answer_style_kwargs["wordWrap"] = "RTL"
+
+    answer_style = ParagraphStyle(
+        **answer_style_kwargs
     )
 
-    weakness_style = ParagraphStyle(
-        "ArmorWeakness",
+    # --------------------------------------------------------
+    # Weakness heading
+    # --------------------------------------------------------
+
+    weakness_heading_style = ParagraphStyle(
+        "ArmorWeaknessHeading",
         parent=styles["Heading2"],
+        fontName=active_font,
         fontSize=11,
-        leading=15,
-        alignment=alignment,
+        leading=16,
+        alignment=query_alignment,
         textColor="#b91c1c",
         spaceBefore=12,
         spaceAfter=5,
     )
 
-    def safe(value):
+    # --------------------------------------------------------
+    # Body
+    # --------------------------------------------------------
 
-        text = (
-            ""
-            if value is None
-            else str(value)
-        )
+    body_style_kwargs = {
+        "name": "ArmorReportBody",
+        "parent": styles["Normal"],
+        "fontName": active_font,
+        "fontSize": 9.5,
+        "leading": 15,
+        "alignment": body_alignment,
+        "textColor": "#334155",
+        "spaceAfter": 7,
+    }
 
+    if is_arabic and rtl_supported:
+        body_style_kwargs["wordWrap"] = "RTL"
+
+    body_style = ParagraphStyle(
+        **body_style_kwargs
+    )
+
+    # ========================================================
+    # HELPER: FORMAT TEXT SAFELY
+    # ========================================================
+
+    def safe_paragraph_text(
+        value,
+    ) -> str:
+        """
+        Convert text into ReportLab-safe paragraph text.
+
+        HTML-sensitive characters are escaped while preserving
+        line breaks.
+        """
+
+        if value is None:
+            return ""
+
+        text = str(value)
+
+        # Normalize line endings.
         text = text.replace(
             "\r\n",
             "\n",
@@ -1045,13 +924,19 @@ def generate_pdf(
             "\n",
         )
 
-        text = escape(text)
-        
+        # Escape HTML/XML characters.
+        text = escape(
+            text,
+            quote=False,
+        )
+
+        # Preserve blank lines.
         text = text.replace(
             "\n\n",
             "<br/><br/>",
         )
 
+        # Preserve remaining line breaks.
         text = text.replace(
             "\n",
             "<br/>",
@@ -1059,23 +944,79 @@ def generate_pdf(
 
         return text
 
+    # ========================================================
+    # HELPER: CREATE PARAGRAPH
+    # ========================================================
+
+    def make_paragraph(
+        text: str,
+        style,
+    ):
+        """
+        Create a Paragraph with Arabic RTL handling
+        when supported.
+        """
+
+        if is_arabic and rtl_supported:
+            try:
+                return Paragraph(
+                    text,
+                    style,
+                )
+            except Exception:
+                # Safe fallback.
+                return Paragraph(
+                    text,
+                    style,
+                )
+
+        return Paragraph(
+            text,
+            style,
+        )
+
+    # ========================================================
+    # STORY
+    # ========================================================
+
     story = []
 
+    # --------------------------------------------------------
+    # TITLE
+    # --------------------------------------------------------
+
+    if is_arabic:
+
+        title_text = safe_paragraph_text(
+            "THE ARMOR — تقرير البحث"
+        )
+
+        subtitle_text = safe_paragraph_text(
+            f"البحث اللاهوتي المدعوم بالأدلة "
+            f"والدفاعيات المسيحية — {language}"
+        )
+
+    else:
+
+        title_text = safe_paragraph_text(
+            "THE ARMOR Research Report"
+        )
+
+        subtitle_text = safe_paragraph_text(
+            "Evidence-Grounded Theological Research & "
+            f"Apologetics — {language}"
+        )
+
     story.append(
-        Paragraph(
-            safe(
-                "THE ARMOR Research Report"
-            ),
+        make_paragraph(
+            title_text,
             title_style,
         )
     )
 
     story.append(
-        Paragraph(
-            safe(
-                "Evidence-Grounded Theological Research & "
-                f"Apologetics — {language}"
-            ),
+        make_paragraph(
+            subtitle_text,
             subtitle_style,
         )
     )
@@ -1089,35 +1030,62 @@ def generate_pdf(
         )
     )
 
+    # ========================================================
+    # CONVERSATION HISTORY
+    # ========================================================
+
     for turn in reversed(history):
 
-        query = safe(
+        query = safe_paragraph_text(
             turn.get(
                 "query",
                 "",
             )
         )
 
-        answer_text = safe(
+        answer_text = safe_paragraph_text(
             turn.get(
                 "answer",
                 "",
             )
         )
 
+        # ----------------------------------------------------
+        # Query
+        # ----------------------------------------------------
+
+        if is_arabic:
+
+            query_label = "السؤال:"
+            answer_label = "الإجابة:"
+
+        else:
+
+            query_label = "Query:"
+            answer_label = "Answer:"
+
+        query_label = escape(
+            query_label,
+            quote=False,
+        )
+
+        answer_label = escape(
+            answer_label,
+            quote=False,
+        )
+
         story.append(
-            Paragraph(
-                f"<b>{'السؤال:' if is_arabic else 'Query:'}</b> "
-                f"{query}",
+            make_paragraph(
+                f"<b>{query_label}</b> {query}",
                 query_style,
             )
         )
 
         story.append(
-            Paragraph(
-                f"<b>{'الإجابة:' if is_arabic else 'Answer:'}</b>"
-                f"<br/>{answer_text}",
-                body_style,
+            make_paragraph(
+                f"<b>{answer_label}</b><br/>"
+                f"{answer_text}",
+                answer_style,
             )
         )
 
@@ -1127,6 +1095,10 @@ def generate_pdf(
                 4,
             )
         )
+
+    # ========================================================
+    # ADVERSARIAL REVIEW
+    # ========================================================
 
     if weakness_data:
 
@@ -1140,141 +1112,143 @@ def generate_pdf(
             )
         )
 
+        if is_arabic:
+
+            weakness_title = (
+                "المراجعة الجدلية / نقاط الضعف"
+            )
+
+        else:
+
+            weakness_title = (
+                "Adversarial Review / Weaknesses"
+            )
+
         story.append(
-            Paragraph(
-                safe(
-                    "Adversarial Review / Weaknesses"
+            make_paragraph(
+                safe_paragraph_text(
+                    weakness_title
                 ),
-                weakness_style,
+                weakness_heading_style,
             )
         )
 
-        for item in getattr(
+        # ----------------------------------------------------
+        # Weakest points
+        # ----------------------------------------------------
+
+        for wp in getattr(
             weakness_data,
             "weakest_points",
             [],
         ):
 
+            bullet = safe_paragraph_text(
+                str(wp)
+            )
+
             story.append(
-                Paragraph(
-                    "• "
-                    + safe(item),
+                make_paragraph(
+                    f"• {bullet}",
                     body_style,
                 )
             )
 
-        defense = getattr(
+        # ----------------------------------------------------
+        # Defense strategy
+        # ----------------------------------------------------
+
+        defense_strategy = getattr(
             weakness_data,
             "defense_strategy",
             [],
         )
 
-        if defense:
+        if defense_strategy:
+
+            if is_arabic:
+
+                defense_title = (
+                    "استراتيجية الدفاع"
+                )
+
+            else:
+
+                defense_title = (
+                    "Defense / Qualification Strategy"
+                )
 
             story.append(
-                Paragraph(
-                    "<b>Defense / Qualification Strategy</b>",
+                make_paragraph(
+                    f"<b>"
+                    f"{safe_paragraph_text(defense_title)}"
+                    f"</b>",
                     body_style,
                 )
             )
 
-            for item in defense:
+            for item in defense_strategy:
 
                 story.append(
-                    Paragraph(
-                        "• "
-                        + safe(item),
+                    make_paragraph(
+                        f"• "
+                        f"{safe_paragraph_text(item)}",
                         body_style,
                     )
                 )
 
-        unsupported = getattr(
+        # ----------------------------------------------------
+        # Unsupported claims
+        # ----------------------------------------------------
+
+        unsupported_claims = getattr(
             weakness_data,
             "unsupported_claims",
             [],
         )
 
-        if unsupported:
+        if unsupported_claims:
+
+            if is_arabic:
+
+                unsupported_title = (
+                    "الادعاءات غير المدعومة"
+                )
+
+            else:
+
+                unsupported_title = (
+                    "Unsupported Claims"
+                )
 
             story.append(
-                Paragraph(
-                    "<b>Unsupported Claims</b>",
+                make_paragraph(
+                    f"<b>"
+                    f"{safe_paragraph_text(unsupported_title)}"
+                    f"</b>",
                     body_style,
                 )
             )
 
-            for item in unsupported:
+            for item in unsupported_claims:
 
                 story.append(
-                    Paragraph(
-                        "• "
-                        + safe(item),
+                    make_paragraph(
+                        f"• "
+                        f"{safe_paragraph_text(item)}",
                         body_style,
                     )
                 )
+
+    # ========================================================
+    # BUILD PDF
+    # ========================================================
 
     doc.build(story)
 
     buffer.seek(0)
 
     return buffer.getvalue()
-
-
-def get_cached_pdf(
-    history: list,
-    weakness_data,
-    language: str,
-) -> bytes:
-
-    # Hashable/simple cache key.
-    history_key = tuple(
-        (
-            str(
-                turn.get(
-                    "query",
-                    "",
-                )
-            ),
-            str(
-                turn.get(
-                    "answer",
-                    "",
-                )
-            ),
-        )
-        for turn in history
-    )
-
-    weakness_key = str(
-        weakness_data
-    )
-
-    key = (
-        history_key,
-        weakness_key,
-        language,
-    )
-
-    if (
-        st.session_state.pdf_cache
-        is not None
-        and st.session_state.pdf_cache_key
-        == key
-    ):
-
-        return st.session_state.pdf_cache
-
-    pdf = generate_pdf(
-        history,
-        weakness_data,
-        language,
-    )
-
-    st.session_state.pdf_cache = pdf
-
-    st.session_state.pdf_cache_key = key
-
-    return pdf
 
 
 # ============================================================
@@ -1290,11 +1264,9 @@ def render_header():
     with center_col:
 
         st.markdown(
-            """
-            <h1 style="text-align:center;">
-                🛡️ THE ARMOR
-            </h1>
-            """,
+            "<h1 style='text-align:center;'>"
+            "🛡️ THE ARMOR"
+            "</h1>",
             unsafe_allow_html=True,
         )
 
@@ -1316,6 +1288,10 @@ def render_sidebar():
             "Research controls"
         )
 
+        # ----------------------------------------------------
+        # Mode
+        # ----------------------------------------------------
+
         stance = st.selectbox(
             "Mode",
             [
@@ -1326,28 +1302,38 @@ def render_sidebar():
             key="setting_stance",
         )
 
+        # ----------------------------------------------------
+        # Language
+        # ----------------------------------------------------
+
         target_lang = st.selectbox(
             "Display / Translation Language",
             SUPPORTED_LANGUAGES,
             key="setting_lang",
         )
 
-        selected_categories = (
-            st.multiselect(
-                "Source filters",
-                [
-                    "Christian Scripture",
-                    "Islamic Scripture",
-                    "Islamic Hadith",
-                    "Islamic History",
-                    "Christian Creed",
-                    "Christian Patristic",
-                    "Jewish Scripture / Commentary",
-                    "Historical / Other",
-                ],
-                key="setting_categories",
-            )
+        # ----------------------------------------------------
+        # Source categories
+        # ----------------------------------------------------
+
+        selected_categories = st.multiselect(
+            "Source filters",
+            [
+                "Christian Scripture",
+                "Islamic Scripture",
+                "Islamic Hadith",
+                "Islamic History",
+                "Christian Creed",
+                "Christian Patristic",
+                "Jewish Scripture / Commentary",
+                "Historical / Other",
+            ],
+            key="setting_categories",
         )
+
+        # ----------------------------------------------------
+        # Evidence count
+        # ----------------------------------------------------
 
         n = st.slider(
             "Evidence segments",
@@ -1355,6 +1341,10 @@ def render_sidebar():
             30,
             key="setting_n",
         )
+
+        # ----------------------------------------------------
+        # Temperature
+        # ----------------------------------------------------
 
         temp = st.slider(
             "Generation temperature",
@@ -1366,6 +1356,10 @@ def render_sidebar():
 
         st.divider()
 
+        # ----------------------------------------------------
+        # Saved conversations
+        # ----------------------------------------------------
+
         st.subheader(
             "Saved Conversations"
         )
@@ -1374,9 +1368,7 @@ def render_sidebar():
             "➕ New Research Thread",
             use_container_width=True,
         ):
-
             start_new_thread()
-
             st.rerun()
 
         if st.session_state.sessions:
@@ -1398,11 +1390,7 @@ def render_sidebar():
                     key=f"load_{sess_id}",
                     use_container_width=True,
                 ):
-
-                    load_session(
-                        sess_id
-                    )
-
+                    load_session(sess_id)
                     st.rerun()
 
         if st.button(
@@ -1411,17 +1399,11 @@ def render_sidebar():
         ):
 
             st.session_state.history = []
-
             st.session_state.sessions = {}
-
             st.session_state.active_session_id = None
-
             st.session_state.answer = None
-
             st.session_state.weakness = None
-
             st.session_state.hits = []
-
             st.session_state.query = ""
 
             clear_translation_cache()
@@ -1462,12 +1444,13 @@ def main():
     except Exception as exc:
 
         st.error(
-            "Could not open the canonical evidence index."
+            "Could not open the canonical evidence index: "
+            f"{exc}"
         )
 
         st.info(
-            "Set LEXICORE_DB_PATH and build the index with "
-            "the ingest command."
+            "Set LEXICORE_DB_PATH and build the index with: "
+            f'python ingest.py --data ./data --db "{DB}"'
         )
 
         st.stop()
@@ -1485,12 +1468,6 @@ def main():
     ) = render_sidebar()
 
     # --------------------------------------------------------
-    # Language change
-    # --------------------------------------------------------
-
-    on_language_change()
-
-    # --------------------------------------------------------
     # Question
     # --------------------------------------------------------
 
@@ -1506,7 +1483,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Buttons
+    # Action buttons
     # --------------------------------------------------------
 
     c1, c2 = st.columns(2)
@@ -1523,7 +1500,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Evidence retrieval
+    # Retrieval
     # --------------------------------------------------------
 
     if retrieve or generate:
@@ -1538,7 +1515,7 @@ def main():
 
         st.session_state.query = q
 
-        categories = (
+        cats = (
             selected_categories
             if selected_categories
             else None
@@ -1548,24 +1525,23 @@ def main():
             "Retrieving evidence…"
         ):
 
-            st.session_state.hits = (
-                store.search(
-                    q,
-                    n=n,
-                    categories=categories,
-                )
+            st.session_state.hits = store.search(
+                q,
+                n=n,
+                categories=cats,
             )
 
-            st.session_state.run_id = (
-                uuid.uuid4().hex
-            )
+        st.session_state.run_id = (
+            uuid.uuid4().hex
+        )
+
+    # --------------------------------------------------------
+    # No evidence
+    # --------------------------------------------------------
 
     if (
         not st.session_state.hits
-        and (
-            retrieve
-            or generate
-        )
+        and (retrieve or generate)
     ):
 
         st.warning(
@@ -1577,7 +1553,7 @@ def main():
     hits = st.session_state.hits
 
     # ========================================================
-    # GENERATION
+    # GENERATE ANSWER
     # ========================================================
 
     if hits:
@@ -1592,12 +1568,38 @@ def main():
             if not selected:
 
                 st.error(
-                    "No evidence segments are available."
+                    "Select at least one evidence segment."
                 )
 
                 st.stop()
 
             try:
+
+                # ------------------------------------------------
+                # IMPORTANT:
+                #
+                # Always generate the canonical answer in English.
+                #
+                # The selected language is a DISPLAY language.
+                #
+                # This gives us one stable source from which we can
+                # translate into any language.
+                # ------------------------------------------------
+
+                effective_query = f"""
+Answer the following theological research question in ENGLISH.
+
+The answer must be evidence-grounded and should use the
+supplied evidence records.
+
+Question:
+{q}
+
+IMPORTANT:
+The canonical response must be written in English.
+It will be translated separately for display if the user
+selects another language.
+"""
 
                 with st.status(
                     "Generating evidence-grounded response...",
@@ -1607,7 +1609,7 @@ def main():
                     started = time.perf_counter()
 
                     result, used = answer(
-                        query=q,
+                        query=effective_query,
                         records=selected,
                         stance=stance,
                         temperature=temp,
@@ -1619,68 +1621,65 @@ def main():
                         - started
                     )
 
-                    st.session_state.answer = (
-                        result
-                    )
-
-                    st.session_state.weakness = (
-                        None
-                    )
-
                     # ------------------------------------------------
-                    # Optional adversarial review.
+                    # Store the canonical English answer.
                     # ------------------------------------------------
-
-                    if stance != (
-                        "Didactic/Explanatory"
-                    ):
-
-                        (
-                            st.session_state.weakness,
-                            _,
-                        ) = assess(
-                            result.answer,
-                            used,
-                            stance=stance,
-                            temperature=temp,
-                        )
-
-                    st.session_state.elapsed = (
-                        elapsed
-                    )
 
                     canonical_answer = (
                         result.answer
                     )
 
+                    st.session_state.answer = result
+                    st.session_state.weakness = None
+
                     # ------------------------------------------------
-                    # Store canonical English answer.
+                    # Adversarial review
+                    # ------------------------------------------------
+
+                    if stance != "Didactic/Explanatory":
+
+                        (
+                            st.session_state.weakness,
+                            _,
+                        ) = assess(
+                            canonical_answer,
+                            used,
+                            stance=stance,
+                            temperature=temp,
+                        )
+
+                    st.session_state.elapsed = elapsed
+
+                    # ------------------------------------------------
+                    # Add the turn.
+                    #
+                    # BOTH fields intentionally contain the same
+                    # canonical English response.
+                    #
+                    # "original_answer" is the permanent source.
+                    # "answer" is kept for compatibility.
                     # ------------------------------------------------
 
                     st.session_state.history.append(
                         {
                             "query": q,
                             "answer": canonical_answer,
-                            "original_answer":
-                                canonical_answer,
+                            "original_answer": canonical_answer,
                         }
                     )
 
                     # ------------------------------------------------
-                    # IMPORTANT:
+                    # VERY IMPORTANT:
                     #
-                    # DO NOT destroy existing translation caches.
-                    #
-                    # This is one of the biggest speed improvements.
-                    #
-                    # Existing translated turns remain valid.
-                    # get_display_history() translates only the
-                    # newly-added turn.
+                    # A new answer means all previous translation
+                    # caches are invalid.
                     # ------------------------------------------------
 
-                    st.session_state.pdf_cache = None
+                    clear_translation_cache()
 
-                    st.session_state.pdf_cache_key = None
+                    # ------------------------------------------------
+                    # Save conversation.
+                    # ------------------------------------------------
 
                     save_current_session()
 
@@ -1692,31 +1691,43 @@ def main():
                         expanded=False,
                     )
 
+                # Clear question field.
                 st.session_state.query = ""
 
+                # Rerun so the generated response appears.
                 st.rerun()
 
-            except APIError:
+            except APIError as api_err:
 
-                st.error(
-                    "The research request could not be completed. "
-                    "Please try again."
+                message = getattr(
+                    api_err,
+                    "message",
+                    str(api_err),
                 )
 
-            except Exception:
-
-                # Do not expose API keys, model internals,
-                # quotas or raw exception details.
                 st.error(
-                    "The research request could not be completed. "
-                    "Please try again."
+                    f"API Error encountered: {message}"
+                )
+
+                st.info(
+                    "The model might be experiencing "
+                    "temporary high traffic or service "
+                    "availability problems. Please try "
+                    "generating the answer again."
+                )
+
+            except Exception as exc:
+
+                st.error(
+                    "An unexpected error occurred "
+                    f"during generation: {exc}"
                 )
 
     # ========================================================
     # DISPLAY CONVERSATION
     # ========================================================
 
-    if st.session_state.history:
+    if st.session_state.get("history"):
 
         st.divider()
 
@@ -1725,25 +1736,25 @@ def main():
         )
 
         # ----------------------------------------------------
-        # Translation happens here only when needed.
+        # Get conversation in selected language.
+        #
+        # This does NOT modify the original English history.
         # ----------------------------------------------------
 
-        display_history = (
-            get_display_history(
-                target_lang
-            )
+        display_history = get_display_history(
+            target_lang
         )
 
         # ----------------------------------------------------
         # PDF
         # ----------------------------------------------------
 
-        pdf_bytes = get_cached_pdf(
+        pdf_bytes = generate_pdf(
             display_history,
             st.session_state.get(
                 "weakness"
             ),
-            target_lang,
+            language=target_lang,
         )
 
         st.download_button(
@@ -1759,7 +1770,7 @@ def main():
         )
 
         # ----------------------------------------------------
-        # Conversation
+        # Conversation messages
         # ----------------------------------------------------
 
         for turn in reversed(
@@ -1788,72 +1799,67 @@ def main():
                     )
                 )
 
-    # ========================================================
-    # GENERATION TIME
-    # ========================================================
+        # ====================================================
+        # GENERATION TIME
+        # ====================================================
 
-    st.caption(
-        "Generation time: "
-        f"{st.session_state.get('elapsed', 0):.2f}s. "
-        "Similarity is a ranking signal, not a truth probability."
-    )
+        st.caption(
+            "Generation time: "
+            f"{st.session_state.get('elapsed', 0):.2f}s. "
+            "Similarity is a ranking signal, not a truth probability."
+        )
 
-    # ========================================================
-    # ADVERSARIAL REVIEW
-    # ========================================================
+        # ====================================================
+        # ADVERSARIAL REVIEW
+        # ====================================================
 
-    if st.session_state.get(
-        "weakness"
-    ):
-
-        w = st.session_state.weakness
-
-        with st.expander(
-            "Adversarial review"
+        if st.session_state.get(
+            "weakness"
         ):
 
-            st.markdown(
-                "**Weakest points**"
-            )
+            w = st.session_state.weakness
 
-            for item in (
-                w.weakest_points
+            with st.expander(
+                "Adversarial review"
             ):
-
-                st.write(
-                    f"- {item}"
-                )
-
-            st.markdown(
-                "**Defense / qualification strategy**"
-            )
-
-            for item in (
-                w.defense_strategy
-            ):
-
-                st.write(
-                    f"- {item}"
-                )
-
-            if w.unsupported_claims:
 
                 st.markdown(
-                    "**Unsupported claims**"
+                    "**Weakest points**"
                 )
 
-                for item in (
-                    w.unsupported_claims
-                ):
+                for x in w.weakest_points:
 
                     st.write(
-                        f"- {item}"
+                        f"- {x}"
                     )
+
+                st.markdown(
+                    "**Defense / qualification strategy**"
+                )
+
+                for x in w.defense_strategy:
+
+                    st.write(
+                        f"- {x}"
+                    )
+
+                if w.unsupported_claims:
+
+                    st.markdown(
+                        "**Unsupported claims**"
+                    )
+
+                    for x in w.unsupported_claims:
+
+                        st.write(
+                            f"- {x}"
+                        )
 
 
 # ============================================================
-# ENTRY POINT
+# APPLICATION ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
     main()
+```
