@@ -507,17 +507,15 @@ def generate_pdf(
     language: str = "English",
 ) -> bytes:
     """
-    Generate a Unicode-compatible PDF.
+    Generate a PDF using a Unicode-compatible font when available.
 
-    Uses DejaVu Sans so characters from:
-    - English
-    - French
-    - Hausa
-    - Igbo
-    - Yoruba
-    - many Arabic/Unicode characters
+    The function first looks for DejaVu Sans. If it cannot find
+    the font, it falls back to Helvetica instead of crashing
+    the entire Streamlit application.
 
-    are much less likely to appear as black dots or boxes.
+    NOTE:
+    DejaVu Sans is recommended for French, Hausa, Igbo and Yoruba.
+    Arabic requires additional RTL/shaping support for perfect output.
     """
 
     from reportlab.pdfbase import pdfmetrics
@@ -536,49 +534,47 @@ def generate_pdf(
     )
 
     # ========================================================
-    # FIND A UNICODE FONT
+    # FIND UNICODE FONT
     # ========================================================
 
     font_candidates = [
-        # Streamlit Cloud / Debian / Ubuntu
+        # Bundled project font — RECOMMENDED
+        str(
+            Path(__file__).resolve().parent
+            / "fonts"
+            / "DejaVuSans.ttf"
+        ),
+
+        # Linux / Streamlit Cloud
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-
-        # Common Linux locations
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-
-        # Local project font
-        "./fonts/DejaVuSans.ttf",
 
         # Windows
         "C:/Windows/Fonts/DejaVuSans.ttf",
-        "C:/Windows/Fonts/arial.ttf",
     ]
 
-    font_path = None
+    font_name = "Helvetica"
 
-    for candidate in font_candidates:
-        if os.path.exists(candidate):
-            font_path = candidate
-            break
+    for font_path in font_candidates:
 
-    if font_path is None:
-        raise RuntimeError(
-            "No Unicode-compatible font was found. "
-            "Please add DejaVuSans.ttf to the project's "
-            "fonts/ directory."
-        )
+        if os.path.isfile(font_path):
 
-    # ========================================================
-    # REGISTER FONT
-    # ========================================================
+            try:
 
-    if "ArmorUnicode" not in pdfmetrics.getRegisteredFontNames():
-        pdfmetrics.registerFont(
-            TTFont(
-                "ArmorUnicode",
-                font_path,
-            )
-        )
+                if "ArmorUnicode" not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(
+                        TTFont(
+                            "ArmorUnicode",
+                            font_path,
+                        )
+                    )
+
+                font_name = "ArmorUnicode"
+
+                break
+
+            except Exception:
+                continue
 
     # ========================================================
     # PDF DOCUMENT
@@ -606,7 +602,7 @@ def generate_pdf(
     title_style = ParagraphStyle(
         "ReportTitle",
         parent=styles["Heading1"],
-        fontName="ArmorUnicode",
+        fontName=font_name,
         fontSize=20,
         leading=24,
         textColor="#1e293b",
@@ -617,7 +613,7 @@ def generate_pdf(
     subtitle_style = ParagraphStyle(
         "ReportSub",
         parent=styles["Normal"],
-        fontName="ArmorUnicode",
+        fontName=font_name,
         fontSize=10,
         leading=14,
         textColor="#64748b",
@@ -628,7 +624,7 @@ def generate_pdf(
     qa_query_style = ParagraphStyle(
         "QAQuery",
         parent=styles["Heading2"],
-        fontName="ArmorUnicode",
+        fontName=font_name,
         fontSize=11,
         leading=15,
         textColor="#1d4ed8",
@@ -639,7 +635,7 @@ def generate_pdf(
     qa_answer_style = ParagraphStyle(
         "QAAnswer",
         parent=styles["Normal"],
-        fontName="ArmorUnicode",
+        fontName=font_name,
         fontSize=9.5,
         leading=14,
         textColor="#334155",
@@ -649,7 +645,7 @@ def generate_pdf(
     weakness_heading = ParagraphStyle(
         "WeaknessHeading",
         parent=styles["Heading2"],
-        fontName="ArmorUnicode",
+        fontName=font_name,
         fontSize=11,
         leading=15,
         textColor="#b91c1c",
@@ -660,7 +656,7 @@ def generate_pdf(
     body_style = ParagraphStyle(
         "ReportBody",
         parent=styles["Normal"],
-        fontName="ArmorUnicode",
+        fontName=font_name,
         fontSize=9.5,
         leading=14,
         textColor="#334155",
@@ -668,17 +664,17 @@ def generate_pdf(
     )
 
     # ========================================================
-    # BUILD STORY
+    # HEADER
     # ========================================================
 
     story = [
         Paragraph(
-            "THE ARMOR Research Report",
+            escape("THE ARMOR Research Report"),
             title_style,
         ),
 
         Paragraph(
-            (
+            escape(
                 "Evidence-Grounded Theological Research & "
                 f"Apologetics — {language}"
             ),
@@ -697,30 +693,17 @@ def generate_pdf(
     # CONVERSATION
     # ========================================================
 
-    for turn in history:
+    for turn in reversed(history):
 
-        query = str(
-            turn.get("query", "")
+        query = escape(
+            str(turn.get("query", ""))
         )
-
-        answer_text = str(
-            turn.get("answer", "")
-        )
-
-        # ----------------------------------------------------
-        # Escape HTML-sensitive characters.
-        # ----------------------------------------------------
-
-        query = escape(query)
 
         answer_text = escape(
-            answer_text
+            str(turn.get("answer", ""))
         )
 
-        # ----------------------------------------------------
         # Preserve line breaks.
-        # ----------------------------------------------------
-
         answer_text = answer_text.replace(
             "\n",
             "<br/>",
@@ -765,7 +748,9 @@ def generate_pdf(
 
         story.append(
             Paragraph(
-                "Adversarial Review / Weaknesses",
+                escape(
+                    "Adversarial Review / Weaknesses"
+                ),
                 weakness_heading,
             )
         )
@@ -780,7 +765,7 @@ def generate_pdf(
             )
 
     # ========================================================
-    # BUILD PDF
+    # BUILD
     # ========================================================
 
     doc.build(story)
