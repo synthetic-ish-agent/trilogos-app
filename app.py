@@ -1045,11 +1045,8 @@ def generate_pdf(
             "\n",
         )
 
-        text = escape(
-            text,
-            quote=False,
-        )
-
+        text = escape(text)
+        
         text = text.replace(
             "\n\n",
             "<br/><br/>",
