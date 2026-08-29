@@ -16,6 +16,24 @@ from reportlab.platypus import (
     Paragraph,
     Spacer,
 )
+import numpy as np
+
+from streamlit_webrtc import (
+    WebRtcMode,
+    webrtc_streamer,
+    create_pcm_audio_source_track,
+)
+
+from lexicore.live_voice import (
+    LiveVoiceState,
+    start_live_voice,
+    stop_live_voice,
+    push_microphone_audio,
+    read_output_audio,
+    read_transcript,
+    read_error,
+    build_voice_history,
+)
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
@@ -1412,6 +1430,403 @@ def render_sidebar():
         temp,
     )
 
+# ============================================================
+# LIVE VOICE
+# ============================================================
+
+def get_live_voice_state():
+
+    if (
+        "live_voice_state"
+        not in st.session_state
+    ):
+
+        st.session_state.live_voice_state = (
+            LiveVoiceState()
+        )
+
+    return st.session_state.live_voice_state
+
+
+def _audio_frame_to_pcm(
+    frame,
+) -> bytes:
+    """
+    Convert an incoming WebRTC audio frame to mono
+    signed 16-bit PCM.
+
+    Gemini Live accepts raw 16-bit PCM.
+    """
+
+    array = frame.to_ndarray()
+
+    # --------------------------------------------------------
+    # Normalize shape.
+    #
+    # Depending on browser/codec, PyAV may give:
+    #
+    #   channels x samples
+    #
+    # or
+    #
+    #   samples
+    # --------------------------------------------------------
+
+    if array.ndim == 2:
+
+        if array.shape[0] > 1:
+
+            array = (
+                array.astype(
+                    np.float32
+                ).mean(
+                    axis=0
+                )
+            )
+
+        else:
+
+            array = array[0]
+
+    array = np.asarray(
+        array
+    )
+
+    # --------------------------------------------------------
+    # Convert to int16.
+    # --------------------------------------------------------
+
+    if array.dtype != np.int16:
+
+        if np.issubdtype(
+            array.dtype,
+            np.floating,
+        ):
+
+            array = np.clip(
+                array,
+                -1.0,
+                1.0,
+            )
+
+            array = (
+                array * 32767
+            ).astype(
+                np.int16
+            )
+
+        else:
+
+            array = array.astype(
+                np.int16
+            )
+
+    # --------------------------------------------------------
+    # Gemini accepts 16 kHz PCM.
+    #
+    # streamlit-webrtc commonly supplies 48 kHz.
+    #
+    # We downsample using linear interpolation.
+    # --------------------------------------------------------
+
+    sample_rate = getattr(
+        frame,
+        "sample_rate",
+        48000,
+    )
+
+    if sample_rate != 16000:
+
+        target_length = int(
+            len(array)
+            * 16000
+            / sample_rate
+        )
+
+        if target_length <= 0:
+            return b""
+
+        old_positions = np.linspace(
+            0,
+            1,
+            len(array),
+            endpoint=False,
+        )
+
+        new_positions = np.linspace(
+            0,
+            1,
+            target_length,
+            endpoint=False,
+        )
+
+        array = np.interp(
+            new_positions,
+            old_positions,
+            array.astype(
+                np.float32
+            ),
+        ).astype(
+            np.int16
+        )
+
+    return array.tobytes()
+
+
+def render_live_voice(
+    stance,
+    target_lang,
+    temp,
+):
+    """
+    Render THE ARMOR's realtime voice conversation.
+    """
+
+    st.divider()
+
+    st.subheader(
+        "🎙️ Live Voice Conversation"
+    )
+
+    st.caption(
+        "Talk naturally with THE ARMOR. "
+        "Your microphone audio is streamed in realtime "
+        "to Gemini Live and spoken responses are streamed "
+        "back to your browser."
+    )
+
+    state = get_live_voice_state()
+
+    # --------------------------------------------------------
+    # Create persistent PCM output source.
+    # --------------------------------------------------------
+
+    if (
+        "live_audio_source"
+        not in st.session_state
+    ):
+
+        st.session_state.live_audio_source = (
+            create_pcm_audio_source_track(
+                key="armor-live-output",
+                sample_rate=24000,
+                ptime=0.02,
+                lifecycle_scope="streamlit-session",
+            )
+        )
+
+    audio_source = (
+        st.session_state.live_audio_source
+    )
+
+    # --------------------------------------------------------
+    # Input callback.
+    #
+    # This runs outside Streamlit's main thread.
+    # --------------------------------------------------------
+
+    def audio_sink_callback(
+        frame,
+    ):
+
+        try:
+
+            pcm = _audio_frame_to_pcm(
+                frame
+            )
+
+            if pcm:
+
+                push_microphone_audio(
+                    state,
+                    pcm,
+                )
+
+        except Exception:
+            # Never allow an audio callback exception
+            # to kill the WebRTC stream.
+            pass
+
+    # --------------------------------------------------------
+    # Feed Gemini output into WebRTC speaker.
+    # --------------------------------------------------------
+
+    while True:
+
+        audio = read_output_audio(
+            state
+        )
+
+        if audio is None:
+            break
+
+        try:
+
+            audio_source.push(
+                audio
+            )
+
+        except Exception:
+            break
+
+    # --------------------------------------------------------
+    # Display transcript.
+    # --------------------------------------------------------
+
+    transcript_placeholder = st.empty()
+
+    transcript_lines = st.session_state.get(
+        "live_transcript",
+        [],
+    )
+
+    while True:
+
+        event = read_transcript(
+            state
+        )
+
+        if event is None:
+            break
+
+        role, text = event
+
+        transcript_lines.append(
+            {
+                "role": role,
+                "text": text,
+            }
+        )
+
+    # Keep the visible transcript bounded.
+    transcript_lines = transcript_lines[
+        -30:
+    ]
+
+    st.session_state.live_transcript = (
+        transcript_lines
+    )
+
+    if transcript_lines:
+
+        transcript_placeholder.markdown(
+            "\n\n".join(
+                (
+                    f"**You:** {item['text']}"
+                    if item["role"] == "user"
+                    else f"**THE ARMOR:** {item['text']}"
+                )
+                for item in transcript_lines
+            )
+        )
+
+    # --------------------------------------------------------
+    # Start / stop buttons.
+    # --------------------------------------------------------
+
+    c1, c2 = st.columns(2)
+
+    start_clicked = c1.button(
+        "🎙️ Start Live Conversation",
+        type="primary",
+        use_container_width=True,
+    )
+
+    stop_clicked = c2.button(
+        "⏹️ Stop Conversation",
+        use_container_width=True,
+    )
+
+    if start_clicked:
+
+        history_text = build_voice_history(
+            st.session_state.get(
+                "history",
+                [],
+            )
+        )
+
+        start_live_voice(
+            state=state,
+            stance=stance,
+            history_text=history_text,
+            language=target_lang,
+            temperature=temp,
+        )
+
+        st.session_state.live_transcript = []
+
+        st.rerun()
+
+    if stop_clicked:
+
+        stop_live_voice(
+            state
+        )
+
+        st.rerun()
+
+    # --------------------------------------------------------
+    # WebRTC.
+    # --------------------------------------------------------
+
+    ctx = webrtc_streamer(
+        key="armor-live-voice",
+        mode=WebRtcMode.SENDRECV,
+        media_stream_constraints={
+            "audio": True,
+            "video": False,
+        },
+        audio_frame_callback=audio_sink_callback,
+        source_audio_track=audio_source,
+        desired_playing_state=True,
+        rtc_configuration={
+            "iceServers": [
+                {
+                    "urls": [
+                        "stun:stun.l.google.com:19302"
+                    ]
+                }
+            ]
+        },
+    )
+
+    # --------------------------------------------------------
+    # Connection status.
+    # --------------------------------------------------------
+
+    if state.connected:
+
+        st.success(
+            "🟢 THE ARMOR is listening."
+        )
+
+    elif state.worker and state.worker.is_alive():
+
+        st.info(
+            "🟡 Connecting to Gemini Live..."
+        )
+
+    else:
+
+        st.info(
+            "⚪ Live voice is stopped."
+        )
+
+    # --------------------------------------------------------
+    # Errors.
+    # --------------------------------------------------------
+
+    error = read_error(
+        state
+    )
+
+    if error:
+
+        st.error(
+            "Live voice could not connect. "
+            "Please try again."
+        )
 
 # ============================================================
 # MAIN
@@ -1456,6 +1871,22 @@ def main():
         n,
         temp,
     ) = render_sidebar()
+
+    # --------------------------------------------------------
+    # LIVE VOICE
+    # --------------------------------------------------------
+
+    render_live_voice(
+        stance=stance,
+        target_lang=target_lang,
+        temp=temp,
+    )
+
+    # --------------------------------------------------------
+    # Language change
+    # --------------------------------------------------------
+
+    on_language_change()
 
     # --------------------------------------------------------
     # Question
