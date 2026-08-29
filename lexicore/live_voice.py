@@ -316,34 +316,40 @@ Current conversation context:
 """
 
     config = types.LiveConnectConfig(
-        response_modalities=[
-            "AUDIO"
-        ],
-        system_instruction=voice_instruction,
-        temperature=max(
-            0.0,
-            min(
-                float(temperature),
-                1.0,
-            ),
-        ),
-        input_audio_transcription=(
-            types.AudioTranscriptionConfig()
-        ),
-        speech_config={
-            "voice_config": {
-                "prebuilt_voice_config": {
-                    "voice_name": "Kore"
-                }
-            }
-        },
-        realtime_input_config={
-            "automatic_activity_detection": {
-                "disabled": False,
-            }
-        },
-    )
+    response_modalities=["AUDIO"],
 
+    system_instruction=voice_instruction,
+
+    temperature=max(
+        0.0,
+        min(
+            float(temperature),
+            1.0,
+        ),
+    ),
+
+    input_audio_transcription=(
+        types.AudioTranscriptionConfig()
+    ),
+
+    speech_config=types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                voice_name="Kore",
+            )
+        )
+    ),
+
+    realtime_input_config=(
+        types.RealtimeInputConfig(
+            automatic_activity_detection=(
+                types.AutomaticActivityDetection(
+                    disabled=False,
+                )
+            )
+        )
+    ),
+)
     async with client.aio.live.connect(
         model=LIVE_MODEL,
         config=config,
