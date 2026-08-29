@@ -6,3 +6,6 @@ torch
 torchvision
 reportlab
 pydantic
+streamlit-webrtc
+av
+numpy
