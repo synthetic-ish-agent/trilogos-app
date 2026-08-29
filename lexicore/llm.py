@@ -1,4 +1,3 @@
-````python
 from __future__ import annotations
 
 import json
@@ -1032,4 +1031,3 @@ Focus on whether the reasoning is actually supported.
         result,
         used,
     )
-````
