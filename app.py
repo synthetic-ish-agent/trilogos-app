@@ -1452,14 +1452,47 @@ def _audio_frame_to_pcm(
     frame,
 ) -> bytes:
     """
-    Convert an incoming WebRTC audio frame to mono
-    signed 16-bit PCM.
+    Convert an incoming WebRTC/PyAV audio frame to
+    mono, signed 16-bit, 16 kHz PCM.
 
-    Gemini Live accepts raw 16-bit PCM.
+    Gemini Live expects raw little-endian 16-bit PCM.
     """
 
-    array = frame.to_ndarray()
+    import av
+    import numpy as np
 
+    try:
+
+        resampler = av.AudioResampler(
+            format="s16",
+            layout="mono",
+            rate=16000,
+        )
+
+        frames = resampler.resample(
+            frame
+        )
+
+        if not frames:
+            return b""
+
+        output = bytearray()
+
+        for converted in frames:
+
+            array = converted.to_ndarray()
+
+            output.extend(
+                np.asarray(
+                    array,
+                    dtype=np.int16,
+                ).tobytes()
+            )
+
+        return bytes(output)
+
+    except Exception:
+        return b""
     # --------------------------------------------------------
     # Normalize shape.
     #
