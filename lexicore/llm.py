@@ -14,6 +14,7 @@ from typing import (
 )
 
 import streamlit as st
+
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -30,7 +31,6 @@ MODEL = os.getenv(
     "gemini-3.6-flash",
 )
 
-# Keep network requests reasonably bounded.
 REQUEST_TIMEOUT_MS = int(
     os.getenv(
         "LEXICORE_GEMINI_TIMEOUT_MS",
@@ -38,7 +38,6 @@ REQUEST_TIMEOUT_MS = int(
     )
 )
 
-# Number of attempts across configured API keys.
 MAX_KEY_ATTEMPTS = int(
     os.getenv(
         "LEXICORE_MAX_KEY_ATTEMPTS",
@@ -46,7 +45,6 @@ MAX_KEY_ATTEMPTS = int(
     )
 )
 
-# Maximum evidence characters sent to Gemini.
 DEFAULT_MAX_CONTEXT_CHARS = int(
     os.getenv(
         "LEXICORE_MAX_CONTEXT_CHARS",
@@ -54,7 +52,6 @@ DEFAULT_MAX_CONTEXT_CHARS = int(
     )
 )
 
-# Maximum user query size.
 MAX_QUERY_CHARS = int(
     os.getenv(
         "LEXICORE_MAX_QUERY_CHARS",
@@ -62,10 +59,7 @@ MAX_QUERY_CHARS = int(
     )
 )
 
-T = TypeVar(
-    "T",
-    bound=BaseModel,
-)
+T = TypeVar("T", bound=BaseModel)
 
 
 # ============================================================
@@ -101,27 +95,127 @@ class Weakness(BaseModel):
 
 
 # ============================================================
+# SAFE STREAMLIT SECRET ACCESS
+# ============================================================
+
+def _get_secret(
+    name: str,
+) -> Optional[str]:
+    """
+    Safely retrieve a Streamlit secret.
+
+    Streamlit raises an exception when secrets.toml does not
+    exist. That must never crash the application.
+    """
+
+    try:
+        value = st.secrets.get(name)
+
+        if value is not None:
+            value = str(value).strip()
+
+            if value:
+                return value
+
+    except Exception:
+        pass
+
+    return None
+
+
+def _get_nested_secret(
+    section: str,
+    name: str,
+) -> Optional[str]:
+    """
+    Support secrets configured like:
+
+        [google]
+        api_key = "..."
+
+    or:
+
+        [gemini]
+        api_key = "..."
+    """
+
+    try:
+        section_data = st.secrets.get(section)
+
+        if section_data is None:
+            return None
+
+        if hasattr(section_data, "get"):
+
+            value = section_data.get(name)
+
+            if value is not None:
+
+                value = str(value).strip()
+
+                if value:
+                    return value
+
+    except Exception:
+        pass
+
+    return None
+
+
+# ============================================================
 # API KEY MANAGEMENT
 # ============================================================
 
 def get_available_keys() -> list[str]:
     """
-    Load numbered Google API keys from Streamlit secrets first,
-    then environment variables.
+    Load all available Google Gemini API keys.
 
-    Supported:
+    Supported Streamlit secrets:
+
+        GOOGLE_API_KEY_1
+        GOOGLE_API_KEY_2
+        GOOGLE_API_KEY_3
+        ...
+
+        GOOGLE_API_KEY
+
+    Supported environment variables:
 
         GOOGLE_API_KEY_1
         GOOGLE_API_KEY_2
         ...
-        GOOGLE_API_KEY_100
-
-    If no numbered keys exist, fall back to:
 
         GOOGLE_API_KEY
+
+    Additional compatible names:
+
+        GEMINI_API_KEY
+
+        GOOGLE_GENAI_API_KEY
+
+    Nested Streamlit secrets are also supported:
+
+        [google]
+        api_key = "..."
+
+        [gemini]
+        api_key = "..."
+
+    IMPORTANT:
+    We scan ALL numbered keys instead of stopping at the first
+    missing number.
+
+    Therefore this works:
+
+        GOOGLE_API_KEY_1 = "..."
+        GOOGLE_API_KEY_3 = "..."
+
+    even if GOOGLE_API_KEY_2 is absent.
     """
 
     keys: list[str] = []
+
+    seen: set[str] = set()
 
     # --------------------------------------------------------
     # Numbered keys
@@ -129,79 +223,111 @@ def get_available_keys() -> list[str]:
 
     for i in range(1, 101):
 
-        secret_name = (
-            f"GOOGLE_API_KEY_{i}"
-        )
+        name = f"GOOGLE_API_KEY_{i}"
 
-        value = None
-
-        # Streamlit secrets first.
-        try:
-            value = st.secrets.get(
-                secret_name
-            )
-        except Exception:
-            value = None
-
-        # Environment fallback.
-        if not value:
-            value = os.getenv(
-                secret_name
-            )
+        value = _get_secret(name)
 
         if not value:
-            # Stop at the first missing numbered key.
-            break
-
-        key = str(value).strip()
-
-        if key:
-            keys.append(key)
-
-    # --------------------------------------------------------
-    # Single-key fallback
-    # --------------------------------------------------------
-
-    if not keys:
-
-        value = None
-
-        try:
-            value = st.secrets.get(
-                "GOOGLE_API_KEY"
-            )
-        except Exception:
-            value = None
-
-        if not value:
-            value = os.getenv(
-                "GOOGLE_API_KEY"
-            )
+            value = os.getenv(name)
 
         if value:
 
-            key = str(value).strip()
+            value = str(value).strip()
 
-            if key:
-                keys.append(key)
+            if value and value not in seen:
 
-    if not keys:
+                keys.append(value)
 
-        raise RuntimeError(
-            "No Google API keys found.\n\n"
-            "Configure GOOGLE_API_KEY_1, GOOGLE_API_KEY_2, etc. "
-            "in .streamlit/secrets.toml."
+                seen.add(value)
+
+    # --------------------------------------------------------
+    # Primary single-key fallback
+    # --------------------------------------------------------
+
+    fallback_names = (
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_GENAI_API_KEY",
+    )
+
+    for name in fallback_names:
+
+        value = _get_secret(name)
+
+        if not value:
+            value = os.getenv(name)
+
+        if value:
+
+            value = str(value).strip()
+
+            if value and value not in seen:
+
+                keys.append(value)
+
+                seen.add(value)
+
+    # --------------------------------------------------------
+    # Nested Streamlit secrets
+    # --------------------------------------------------------
+
+    nested_locations = (
+        ("google", "api_key"),
+        ("google", "GOOGLE_API_KEY"),
+        ("gemini", "api_key"),
+        ("gemini", "GEMINI_API_KEY"),
+    )
+
+    for section, name in nested_locations:
+
+        value = _get_nested_secret(
+            section,
+            name,
         )
+
+        if value and value not in seen:
+
+            keys.append(value)
+
+            seen.add(value)
+
+    # --------------------------------------------------------
+    # Return keys
+    # --------------------------------------------------------
 
     return keys
 
 
-def _current_key_index() -> int:
+def require_api_keys() -> list[str]:
     """
-    Return the current key index safely.
+    Return configured API keys or raise a clean configuration
+    error.
+
+    No secret values are ever included in the error.
     """
 
     keys = get_available_keys()
+
+    if keys:
+        return keys
+
+    raise RuntimeError(
+        "No Google Gemini API key is configured. "
+        "Add GOOGLE_API_KEY_1 to Streamlit Secrets "
+        "or set GOOGLE_API_KEY_1 as an environment variable."
+    )
+
+
+# ============================================================
+# CURRENT KEY INDEX
+# ============================================================
+
+def _current_key_index() -> int:
+    """
+    Return the current API-key index safely.
+    """
+
+    keys = require_api_keys()
 
     index = st.session_state.get(
         "lexicore_key_index",
@@ -220,12 +346,16 @@ def _current_key_index() -> int:
     return index % len(keys)
 
 
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
+
 def get_next_client() -> genai.Client:
     """
-    Create a Gemini client using the currently selected API key.
+    Create a Gemini client using the currently selected key.
     """
 
-    keys = get_available_keys()
+    keys = require_api_keys()
 
     index = _current_key_index()
 
@@ -239,20 +369,26 @@ def get_next_client() -> genai.Client:
     )
 
 
+def client() -> genai.Client:
+    """
+    Public LexiCore client helper.
+    """
+
+    return get_next_client()
+
+
+# ============================================================
+# API KEY ROTATION
+# ============================================================
+
 def rotate_key_on_error() -> bool:
     """
-    Move to the next configured API key silently.
+    Move silently to the next configured API key.
 
-    Returns True when rotation actually occurred.
-
-    IMPORTANT:
-    API-key rotation is intentionally hidden from the user.
-
-    Internal API failures, key numbers, quotas, and retry details
-    should not be displayed in the application interface.
+    Returns True if rotation was possible.
     """
 
-    keys = get_available_keys()
+    keys = require_api_keys()
 
     if len(keys) <= 1:
         return False
@@ -267,18 +403,7 @@ def rotate_key_on_error() -> bool:
         new_index
     )
 
-    # Intentionally no st.warning() here.
-    # Key rotation happens silently.
-
     return True
-
-
-def client() -> genai.Client:
-    """
-    Public helper for code elsewhere in LexiCore.
-    """
-
-    return get_next_client()
 
 
 # ============================================================
@@ -287,13 +412,7 @@ def client() -> genai.Client:
 
 def check_gemini_dns() -> tuple[bool, str]:
     """
-    Lightweight DNS check.
-
-    This is useful because your current application error is:
-
-        [Errno 11001] getaddrinfo failed
-
-    which is a Windows hostname-resolution error.
+    Check whether Google's Gemini endpoint can be resolved.
     """
 
     hostname = (
@@ -344,7 +463,8 @@ def context(
     max_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
 ):
     """
-    Build the evidence context while respecting the character limit.
+    Build the evidence context while respecting the character
+    limit.
     """
 
     parts: list[str] = []
@@ -360,8 +480,6 @@ def context(
 
         block = record.evidence_block(i)
 
-        # If this record alone is larger than the limit,
-        # skip it rather than exceeding the context budget.
         if len(block) > max_chars:
             continue
 
@@ -389,106 +507,101 @@ def instructions(
 ) -> str:
 
     base = f"""
-You are LexiCore (also known as THE ARMOR), an elite, uncompromising theological research,
-apologetics, and cross-examination assistant. Your fundamental purpose, permanent stance,
-and sworn duty are to exclusively speak, defend, champion, and fight for Christianity and
-the Holy Catholic Church. You are not a neutral, multi-faith tool; you are a dedicated
-apologetic defender of orthodox Christian truth, Sacred Scripture, Sacred Tradition, and
-the Catholic Magisterium.
+You are LexiCore (also known as THE ARMOR), an elite theological research,
+apologetics, and cross-examination assistant.
+
+Your fundamental purpose is to defend and explain orthodox Christian truth,
+Sacred Scripture, Sacred Tradition, and Catholic teaching.
 
 LANGUAGE & COMMUNICATION STYLE:
 
-Write in plain, clear, everyday English infused with a natural, relatable conversational flow
-that an ordinary Nigerian can connect with instantly.
+Write in plain, clear, everyday English with a natural conversational flow
+that an ordinary Nigerian can understand immediately.
 
-Avoid heavy, complex academic grammar, high-brow European structural phrasing, or dense jargon.
+Avoid unnecessarily complicated academic grammar and dense jargon.
 
-Sound like a brilliant, knowledgeable brother or apologist breaking down deep truths clearly
-during a church fellowship, youth meeting, or a straightforward street-smart discussion.
+Sound like a brilliant, knowledgeable Christian apologist explaining deep
+truths clearly during a church fellowship, youth meeting, classroom, or
+serious theological discussion.
 
-Keep sentences punchy, direct, and engaging without ever losing your fierce, unyielding defense
-of the Christian faith.
+Keep sentences direct and engaging without sacrificing theological accuracy.
 
-Current Research Mode / Stance:
+CURRENT RESEARCH MODE:
+
 {stance}
 
 CORE RULES:
 
-EVIDENCE GROUNDING & INTELLIGENT FALLBACK
+EVIDENCE GROUNDING
 
-Use the supplied evidence segments as part of your evidential basis, interpreting and framing
-them always to uphold, defend, and advance Christian and Catholic doctrine.
+Use the supplied evidence segments as part of the evidential basis.
 
-FLEXIBLE KNOWLEDGE RULE:
+Do not pretend that a source says something it does not say.
 
-If the supplied evidence segments do not contain the specific text, verse, or source requested,
-seamlessly draw upon your broad theological and historical knowledge to answer the user thoroughly.
+FLEXIBLE KNOWLEDGE
+
+If the supplied evidence does not contain the exact verse, text, or source
+requested, you may use established theological and historical knowledge.
+
+Clearly distinguish supplied evidence from broader knowledge.
 
 NO FABRICATION
 
-Never invent:
+Never invent Bible quotations.
 
-Fake Bible quotations or references. If using general knowledge, cite genuine, accurate references.
+Never invent Quran quotations.
 
-Fake Quran quotations, Hadith numbers, or historical claims.
+Never invent Hadith numbers.
+
+Never invent historical sources.
+
+Never invent evidence IDs.
 
 CITATION DISCIPLINE
 
-Every citation from the database must use an evidence_id that actually appears in the supplied evidence.
+Every database citation must use an evidence_id that actually appears in
+the supplied evidence.
 
-If relying on general external knowledge, state the historical or traditional source plainly without fake IDs.
+If relying on broader knowledge, do not manufacture a database evidence ID.
 
-UNWAVERING CATHOLIC & CHRISTIAN PRIORITY
+CHRISTIAN AND CATHOLIC PRIORITY
 
-When the question concerns Christian doctrine, Jesus Christ's divinity, Virgin Mary, the sacraments,
-ecclesiology, or Christian theology, you must fiercely prioritize Christian and Catholic sources,
-including Scripture, conciliar decrees, creeds, patristic material, and the teachings of the Church.
+When discussing Christian doctrine, Jesus Christ, Scripture, Mary,
+the sacraments, ecclesiology, Church history, or Christian theology,
+prioritize Christian and Catholic sources.
 
-When addressing competing religious claims or objections, such as from Islam, Judaism, or secularism,
-evaluate them critically and polemically from a robust Christian and Catholic apologetic standpoint.
+When addressing competing religious claims, evaluate them critically from
+a Christian and Catholic apologetic standpoint.
 
-Expose theological flaws, historical discrepancies, and textual weaknesses in opposing systems without
-ever compromising Christian truth or validating non-Christian doctrines as superior.
+INTELLECTUAL RIGOR
 
-RELEVANCE & PRECISION
+Distinguish between:
 
-Use evidence and knowledge that are rigorously relevant to the user's question, weaponizing them
-to support the orthodox Christian position.
+established evidence,
 
-INTELLECTUAL RIGOR & DISTINCTIONS
+theological interpretation,
 
-Distinguish clearly between:
+historical tradition,
 
-general theological knowledge and tradition,
+and genuine uncertainty.
 
-orthodox interpretation,
+Do not present speculation as established fact.
 
-and unresolved external uncertainty.
+COUNTERARGUMENTS
 
-AGGRESSIVE DEFENSE & DEBATE QUALITY
+When appropriate, directly address objections and competing interpretations.
 
-Do not merely agree with anti-Christian or skeptical premises. Systematically test, deconstruct,
-and dismantle opposing objections against the evidence and the rock of Catholic truth.
-
-Maintain a formidable, razor-sharp defense strategy.
-
-COUNTER-QUESTIONS & CONTINUOUS ENGAGEMENT
-
-If the user is responding to a previous argument, directly address the new objection with
-unyielding theological force rather than resetting the entire discussion.
+Do not merely repeat the user's premise.
 
 HISTORICAL INTEGRITY
 
-Never treat the absence of a document in a local search folder as proof that a theological fact
-does not exist.
+The absence of a source in the local evidence database does not prove that
+the source or historical fact does not exist.
 
-Always interpret data in alignment with the robust historical integrity and tradition of the
-universal Christian faith.
+CURRENT MODE:
+
+{stance}
 """
-
-    # ========================================================
-    # DIDACTIC MODE
-    # ========================================================
 
     if "Didactic" in stance:
 
@@ -496,22 +609,15 @@ universal Christian faith.
 
 MODE: DIDACTIC / EXPLANATORY
 
-Explain concepts clearly, progressively, and persuasively in a smooth, continuous narrative format.
+Explain the issue clearly and progressively.
 
-STRUCTURAL REQUIREMENT:
+Use cohesive prose rather than mechanical bullet points.
 
-Do not use raw bullet points, numbered headers, or mechanical labels.
+Define the issue, explain the evidence, reason through the argument,
+address likely objections, and finish with a clear conclusion.
 
-Instead, weave your explanation together into cohesive, flowing paragraphs that naturally define
-the issue, present the relevant evidence or background, explain the reasoning, address anticipated
-objections, and conclude with the strongest supported Christian position.
-
-Prefer clarity over unnecessary technical language without ever compromising orthodox doctrine.
+Prefer clarity and readability.
 """
-
-    # ========================================================
-    # SCHOLARLY MODE
-    # ========================================================
 
     if "Scholarly" in stance:
 
@@ -519,33 +625,15 @@ Prefer clarity over unnecessary technical language without ever compromising ort
 
 MODE: SCHOLARLY / DEBATE
 
-Use rigorous academic reasoning delivered entirely through polished, professional prose.
+Use rigorous academic reasoning in polished professional prose.
 
-STRUCTURAL REQUIREMENT:
+Avoid mechanical numbered lists and bullet-heavy structures.
 
-Absolutely do not output numerical lists, headers, or bullet points such as:
+Treat textual evidence, historical evidence, theological interpretation,
+and counterarguments carefully.
 
-"1. Claim"
-"2. Evidence"
-"3. Interpretation"
-
-Instead, synthesize your entire analysis into smooth, cohesive, high-level theological essay paragraphs.
-
-Seamlessly integrate your argument so that it reads like a professional theological journal article.
-
-Begin by introducing the core proposition or claim being debated.
-
-Transition smoothly into evaluating textual and historical data, carefully distinguishing database text
-from broader tradition.
-
-Address competing counterarguments, dissect underlying assumptions, and provide a robust response.
-
-Conclude with a rigorous, defensible, and unwavering Christian and Catholic resolution.
+Produce a coherent theological argument with a defensible conclusion.
 """
-
-    # ========================================================
-    # SKEPTICAL MODE
-    # ========================================================
 
     if "Skeptical" in stance:
 
@@ -553,16 +641,12 @@ Conclude with a rigorous, defensible, and unwavering Christian and Catholic reso
 
 MODE: SKEPTICAL / CONTRARIAN
 
-Use a critical, probing lens delivered through flowing, cohesive paragraphs.
+Use a critical and probing lens.
 
-STRUCTURAL REQUIREMENT:
+Examine unsupported assumptions, weak inferences, textual ambiguities,
+historical uncertainties, and alternative interpretations.
 
-Avoid mechanical bullet points or numbered lists.
-
-Write your critical analysis as a unified, rigorous essay that targets unsupported assumptions,
-weak inferences, textual ambiguities, and historical uncertainties in opposing or weak arguments.
-
-Maintain a steadfast defense of Christian truth while dismantling flawed premises with intellectual sharpness.
+Maintain Christian theological integrity while critically examining claims.
 """
 
     return base
@@ -584,9 +668,6 @@ def _error_text(
 def _is_retryable_error(
     exc: Exception,
 ) -> bool:
-    """
-    Determine whether another API key/request should be attempted.
-    """
 
     text = _error_text(
         exc
@@ -600,11 +681,13 @@ def _is_retryable_error(
         "403",
         "permission_denied",
         "leaked",
-        "503",
-        "service unavailable",
+        "401",
+        "unauthorized",
         "500",
         "502",
+        "503",
         "504",
+        "service unavailable",
         "timeout",
         "timed out",
         "connecterror",
@@ -631,9 +714,6 @@ def _parse_response(
     response: Any,
     schema: Type[T],
 ) -> T:
-    """
-    Parse a Gemini response into the requested Pydantic model.
-    """
 
     parsed = getattr(
         response,
@@ -669,7 +749,10 @@ def _parse_response(
         text
     ).strip()
 
-    # Remove accidental Markdown JSON fences.
+    # --------------------------------------------------------
+    # Remove Markdown JSON fences.
+    # --------------------------------------------------------
+
     if clean_text.startswith(
         "```json"
     ):
@@ -703,9 +786,7 @@ def _parse_response(
     except json.JSONDecodeError as exc:
 
         raise RuntimeError(
-            "Gemini returned invalid JSON despite structured-output "
-            "configuration.\n\n"
-            f"Response:\n{clean_text[:5000]}"
+            "Gemini returned invalid structured output."
         ) from exc
 
     return schema.model_validate(
@@ -724,10 +805,8 @@ def _generate(
     temperature: float = 0.2,
 ) -> T:
 
-    keys = get_available_keys()
+    keys = require_api_keys()
 
-    # Do not attempt more times than there are configured keys,
-    # but also respect MAX_KEY_ATTEMPTS.
     attempts = min(
         len(keys),
         max(
@@ -762,7 +841,9 @@ def _generate(
                             ),
                         ),
                         max_output_tokens=4000,
-                        response_mime_type="application/json",
+                        response_mime_type=(
+                            "application/json"
+                        ),
                         response_schema=schema,
                     ),
                 )
@@ -778,7 +859,7 @@ def _generate(
             last_error = exc
 
             # ------------------------------------------------
-            # Retryable failure
+            # Retryable API/network failure.
             # ------------------------------------------------
 
             if _is_retryable_error(
@@ -789,28 +870,24 @@ def _generate(
 
                     rotate_key_on_error()
 
-                    # Small delay prevents immediate hammering.
-                    time.sleep(0.3)
+                    time.sleep(
+                        0.5
+                    )
 
                     continue
 
             # ------------------------------------------------
-            # Non-retryable failure
+            # Non-retryable failure.
             # ------------------------------------------------
 
             raise RuntimeError(
-                "LexiCore Gemini generation failed.\n\n"
-                f"Model: {MODEL}\n"
-                f"API key attempted: #{current_index + 1}\n"
-                f"Attempt: {attempt + 1}/{attempts}\n"
-                f"Error: {_error_text(exc)}"
+                "LexiCore Gemini generation failed."
             ) from exc
 
     raise RuntimeError(
-        "LexiCore Gemini generation failed after all available "
-        "API keys were attempted. Last error: "
-        f"{_error_text(last_error) if last_error else 'unknown error'}"
-    )
+        "LexiCore Gemini generation failed after all "
+        "available API keys were attempted."
+    ) from last_error
 
 
 # ============================================================
@@ -869,8 +946,11 @@ def answer(
 
             previous_answer = str(
                 turn.get(
-                    "answer",
-                    "",
+                    "original_answer",
+                    turn.get(
+                        "answer",
+                        "",
+                    ),
                 )
             ).strip()
 
@@ -896,14 +976,17 @@ def answer(
 {history_text}
 
 CURRENT QUERY / COUNTER-QUESTION:
+
 {query}
 
 SUPPLIED EVIDENCE:
+
 {ctx}
 
 TASK:
 
-Answer the current query using the supplied evidence.
+Answer the current query using the supplied evidence and
+relevant established theological knowledge.
 
 Requirements:
 
@@ -922,6 +1005,8 @@ Use only evidence IDs that actually appear in the supplied evidence.
 If the evidence is insufficient, explicitly state the limitation.
 
 Provide a rigorous but readable response.
+
+The canonical answer must be written in English.
 """
 
     result = _generate(
@@ -999,23 +1084,25 @@ Identify genuine weaknesses in the argument using the supplied evidence.
 
 Evaluate:
 
-Logical weaknesses
+Logical weaknesses.
 
-Unsupported assumptions
+Unsupported assumptions.
 
-Evidential gaps
+Evidential gaps.
 
-Textual problems
+Textual problems.
 
-Alternative interpretations
+Alternative interpretations.
 
-Claims that are stronger than the evidence allows
+Claims that are stronger than the evidence allows.
 
 Then propose defensible repairs.
 
-Do not invent evidence or citations.
+Do not invent evidence.
 
-Do not criticize the argument merely for being controversial.
+Do not invent citations.
+
+Do not criticize the argument merely because it is controversial.
 
 Focus on whether the reasoning is actually supported.
 """

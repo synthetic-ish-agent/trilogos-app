@@ -9,7 +9,7 @@ from copy import deepcopy
 
 import streamlit as st
 
-from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 from reportlab.platypus import (
     HRFlowable,
     SimpleDocTemplate,
@@ -22,10 +22,10 @@ from reportlab.lib.styles import (
     ParagraphStyle,
 )
 from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from xml.sax.saxutils import escape
-
-from google import genai
-from google.genai.errors import APIError
 
 from lexicore.store import EvidenceStore
 from lexicore.store import DEFAULT_COLLECTION
@@ -72,10 +72,10 @@ DB = os.getenv(
 
 COLLECTION = os.getenv(
     "LEXICORE_COLLECTION",
-    "lexicore_evidence_v3",
+    DEFAULT_COLLECTION,
 )
 
-TRANSLATION_MODEL = "gemini-3.6-flash"
+TRANSLATION_MODEL = MODEL
 
 
 SUPPORTED_LANGUAGES = [
@@ -123,7 +123,12 @@ def get_store():
         )
 
     # Automatically ingest evidence if the collection is empty.
-    if store.count() == 0:
+    try:
+        count = store.count()
+    except Exception:
+        count = 0
+
+    if count == 0:
 
         data_path = Path("./data")
 
@@ -148,9 +153,9 @@ def init():
     """
     Initialize all Streamlit session state values.
 
-    Important:
-    - history stores the ORIGINAL English responses.
-    - translation_cache stores translated display versions.
+    The application maintains the canonical conversation in
+    English. Translations are cached separately and never
+    overwrite the original English conversation.
     """
 
     defaults = {
@@ -158,7 +163,7 @@ def init():
         "query": "",
         "answer": None,
         "weakness": None,
-        "run_id": str(uuid.uuid4().hex),
+        "run_id": uuid.uuid4().hex,
 
         "history": [],
         "sessions": {},
@@ -171,20 +176,6 @@ def init():
         "setting_lang": "English",
         "last_lang": "English",
 
-        # ----------------------------------------------------
-        # Translation cache
-        #
-        # {
-        #     "French": [
-        #         {
-        #             "query": "...",
-        #             "answer": "..."
-        #         }
-        #     ],
-        #     "Hausa": [...]
-        # }
-        # ----------------------------------------------------
-
         "translation_cache": {},
 
         "elapsed": 0.0,
@@ -192,10 +183,8 @@ def init():
 
     for key, value in defaults.items():
 
-        st.session_state.setdefault(
-            key,
-            value,
-        )
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 
 # ============================================================
@@ -207,26 +196,25 @@ def translate_text(
     target_lang: str,
 ) -> str:
     """
-    Translate an existing English response into the selected
-    language.
+    Translate an existing English response into target_lang.
 
-    Uses LexiCore's multi-key Gemini system.
-
-    API failures and key rotation are intentionally hidden
-    from the user interface.
+    Translation failures are intentionally silent at the UI
+    level. The original English response is returned if
+    translation fails.
     """
 
     if not text:
         return text
 
-    if target_lang == "English":
+    target_lang = str(target_lang).strip()
+
+    if not target_lang or target_lang == "English":
         return text
 
     try:
         keys = get_available_keys()
 
     except Exception:
-        # Keep API configuration errors out of the UI.
         return text
 
     if not keys:
@@ -248,6 +236,8 @@ Do NOT omit information.
 
 Do NOT add information.
 
+Do NOT change the argument.
+
 Preserve the exact meaning.
 
 Preserve theological terminology accurately.
@@ -262,7 +252,7 @@ Preserve citations.
 
 Preserve evidence IDs.
 
-Preserve Markdown structure.
+Preserve Markdown structure where applicable.
 
 Preserve paragraphs.
 
@@ -271,8 +261,6 @@ Preserve headings.
 Preserve numbered lists.
 
 Preserve bullet points.
-
-Do not change the argument.
 
 Do not introduce new theological claims.
 
@@ -287,7 +275,10 @@ ORIGINAL ENGLISH RESPONSE:
 {text}
 """
 
-    attempts = len(keys)
+    attempts = max(
+        1,
+        len(keys),
+    )
 
     last_error = None
 
@@ -298,7 +289,7 @@ ORIGINAL ENGLISH RESPONSE:
             ai_client = get_next_client()
 
             response = ai_client.models.generate_content(
-                model=MODEL,
+                model=TRANSLATION_MODEL,
                 contents=prompt,
             )
 
@@ -310,7 +301,12 @@ ORIGINAL ENGLISH RESPONSE:
 
             if translated:
 
-                return translated.strip()
+                translated = str(
+                    translated
+                ).strip()
+
+                if translated:
+                    return translated
 
             last_error = RuntimeError(
                 "Empty translation response."
@@ -333,6 +329,7 @@ ORIGINAL ENGLISH RESPONSE:
                     "quota",
                     "403",
                     "permission_denied",
+                    "leaked",
                     "500",
                     "502",
                     "503",
@@ -344,7 +341,9 @@ ORIGINAL ENGLISH RESPONSE:
                     "connection reset",
                     "connection aborted",
                     "temporary failure",
+                    "name or service not known",
                     "getaddrinfo failed",
+                    "nodename nor servname",
                     "unexpected eof",
                 )
             )
@@ -354,26 +353,15 @@ ORIGINAL ENGLISH RESPONSE:
 
             if attempt < attempts - 1:
 
-                # Silent key rotation.
-                rotate_key_on_error()
+                # Rotate silently.
+                try:
+                    rotate_key_on_error()
+                except Exception:
+                    pass
 
                 time.sleep(0.5)
 
-                continue
-
-            break
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Do NOT display the API error.
-    # Do NOT display the key number.
-    # Do NOT display quota information.
-    # Do NOT display the exception.
-    #
-    # Simply return the original text.
-    # --------------------------------------------------------
-
+    # Never expose the underlying API error to the user.
     return text
 
 
@@ -389,7 +377,6 @@ def translate_history(
     Translate an entire conversation from the ORIGINAL
     English responses.
 
-    The returned list is for display only.
     The original history is never modified.
     """
 
@@ -400,14 +387,12 @@ def translate_history(
 
     for turn in history:
 
-        # New format stores original_answer.
-        #
-        # The fallback is useful for conversations created by
-        # older versions of the application.
-
         original_answer = turn.get(
             "original_answer",
-            turn.get("answer", ""),
+            turn.get(
+                "answer",
+                "",
+            ),
         )
 
         translated_answer = translate_text(
@@ -438,10 +423,6 @@ def get_display_history(
 ) -> list:
     """
     Return the conversation in the currently selected language.
-
-    English uses the original history.
-
-    Other languages use the translation cache.
     """
 
     history = st.session_state.get(
@@ -462,9 +443,6 @@ def get_display_history(
     if cached is not None:
         return cached
 
-    # Translation is performed only when this language has not
-    # already been translated.
-
     translated = translate_history(
         history,
         target_lang,
@@ -483,16 +461,11 @@ def get_display_history(
 
 def on_language_change():
     """
-    Called when the language selectbox changes.
-
-    IMPORTANT:
-    This does NOT modify the original English conversation.
-
-    It creates/loads a translation cache instead.
+    Handle language changes without modifying the canonical
+    English conversation.
     """
 
     new_lang = st.session_state.setting_lang
-
     old_lang = st.session_state.last_lang
 
     if new_lang == old_lang:
@@ -500,15 +473,12 @@ def on_language_change():
 
     st.session_state.last_lang = new_lang
 
-    # Nothing to translate if there is no conversation yet.
     if not st.session_state.history:
         return
 
-    # English is already the canonical language.
     if new_lang == "English":
         return
 
-    # If this language was already translated, do nothing.
     if new_lang in st.session_state.translation_cache:
         return
 
@@ -534,8 +504,8 @@ def clear_translation_cache():
     """
     Remove all cached translations.
 
-    This should happen whenever the underlying conversation
-    changes.
+    Translation caches must be invalidated whenever the
+    underlying English conversation changes.
     """
 
     st.session_state.translation_cache = {}
@@ -563,16 +533,24 @@ def save_current_session():
     if not st.session_state.active_session_id:
 
         st.session_state.active_session_id = (
-            str(uuid.uuid4().hex)
+            uuid.uuid4().hex
         )
 
-    session_id = st.session_state.active_session_id
+    session_id = (
+        st.session_state.active_session_id
+    )
 
     title = (
         history[0]
-        .get("query", "Research")
+        .get(
+            "query",
+            "Research",
+        )
         .strip()
     )
+
+    if not title:
+        title = "Research"
 
     if len(title) > 30:
         title = title[:30] + "..."
@@ -629,13 +607,57 @@ def load_session(
         )
     )
 
-    st.session_state.active_session_id = session_id
+    st.session_state.active_session_id = (
+        session_id
+    )
+
     st.session_state.answer = None
     st.session_state.weakness = None
     st.session_state.hits = []
     st.session_state.query = ""
 
     clear_translation_cache()
+
+
+# ============================================================
+# PDF HELPER
+# ============================================================
+
+def safe_paragraph_text(
+    value,
+) -> str:
+    """
+    Convert arbitrary text into safe ReportLab Paragraph XML.
+
+    ReportLab Paragraph uses XML-like markup, so user/model text
+    must be escaped before being inserted into a Paragraph.
+
+    Newlines are converted into <br/> elements.
+    """
+
+    if value is None:
+        return ""
+
+    text = str(value)
+
+    text = text.replace(
+        "\r\n",
+        "\n",
+    )
+
+    text = text.replace(
+        "\r",
+        "\n",
+    )
+
+    text = escape(text)
+
+    text = text.replace(
+        "\n",
+        "<br/>",
+    )
+
+    return text
 
 
 # ============================================================
@@ -648,67 +670,42 @@ def generate_pdf(
     language: str = "English",
 ) -> bytes:
     """
-    Generate a Unicode-safe THE ARMOR research PDF.
+    Generate a Unicode-aware THE ARMOR research PDF.
 
     Supported languages:
-    English
-    French
-    Hausa
-    Igbo
-    Yoruba
-    Arabic
+
+        English
+        French
+        Hausa
+        Igbo
+        Yoruba
+        Arabic
 
     Font strategy:
-    - DejaVu Sans for Latin-based languages
-    - Noto Naskh Arabic for Arabic
 
-    Arabic:
-    - Uses ReportLab's RTL paragraph support when available.
-    - Uses shaping/bidi support when available.
-    - Falls back safely if optional RTL support is unavailable.
+        Latin languages:
+            DejaVu Sans when available.
 
-    IMPORTANT:
-    The actual font files must exist in:
+        Arabic:
+            Noto Naskh Arabic when available.
+
+    Expected font files:
 
         fonts/DejaVuSans.ttf
         fonts/NotoNaskhArabic-Regular.ttf
     """
 
-    from pathlib import Path
-    from io import BytesIO
-
-    from reportlab.lib.enums import (
-        TA_CENTER,
-        TA_RIGHT,
-        TA_LEFT,
-    )
-
-    from reportlab.lib.pagesizes import letter
-
-    from reportlab.lib.styles import (
-        getSampleStyleSheet,
-        ParagraphStyle,
-    )
-
-    from reportlab.lib.units import mm
-
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-
-    from reportlab.platypus import (
-        SimpleDocTemplate,
-        Paragraph,
-        Spacer,
-        HRFlowable,
-    )
-
     # ========================================================
     # FONT PATHS
     # ========================================================
 
-    base_dir = Path(__file__).resolve().parent
+    base_dir = Path(
+        __file__
+    ).resolve().parent
 
-    fonts_dir = base_dir / "fonts"
+    fonts_dir = (
+        base_dir / "fonts"
+    )
 
     latin_font_path = (
         fonts_dir / "DejaVuSans.ttf"
@@ -743,7 +740,6 @@ def generate_pdf(
             latin_font = "ArmorDejaVu"
 
         except Exception:
-
             latin_font = "Helvetica"
 
     # ========================================================
@@ -771,15 +767,20 @@ def generate_pdf(
             arabic_font = "ArmorArabic"
 
         except Exception:
-
             arabic_font = latin_font
 
     # ========================================================
-    # DETERMINE WHETHER THIS IS ARABIC
+    # LANGUAGE
     # ========================================================
 
+    language_normalized = (
+        str(language)
+        .strip()
+        .lower()
+    )
+
     is_arabic = (
-        str(language).strip().lower()
+        language_normalized
         in {
             "arabic",
             "العربية",
@@ -793,10 +794,9 @@ def generate_pdf(
         else latin_font
     )
 
-    # ========================================================
-    # OPTIONAL RTL / ARABIC SUPPORT
-    # ========================================================
-
+    # ReportLab's basic Paragraph engine does not provide full
+    # Arabic shaping/bidi support by itself. We therefore use
+    # right alignment and an Arabic-compatible font safely.
     rtl_supported = False
 
     # ========================================================
@@ -826,15 +826,7 @@ def generate_pdf(
 
     styles = getSampleStyleSheet()
 
-    if is_arabic and rtl_supported:
-
-        title_alignment = TA_RIGHT
-        subtitle_alignment = TA_RIGHT
-        query_alignment = TA_RIGHT
-        answer_alignment = TA_RIGHT
-        body_alignment = TA_RIGHT
-
-    elif is_arabic:
+    if is_arabic:
 
         title_alignment = TA_RIGHT
         subtitle_alignment = TA_RIGHT
@@ -861,7 +853,7 @@ def generate_pdf(
         fontSize=20,
         leading=26,
         alignment=title_alignment,
-        textColor="#1e293b",
+        textColor=colors.HexColor("#1e293b"),
         spaceAfter=5,
     )
 
@@ -876,7 +868,7 @@ def generate_pdf(
         fontSize=9.5,
         leading=14,
         alignment=subtitle_alignment,
-        textColor="#64748b",
+        textColor=colors.HexColor("#64748b"),
         spaceAfter=14,
     )
 
@@ -891,7 +883,7 @@ def generate_pdf(
         fontSize=11,
         leading=16,
         alignment=query_alignment,
-        textColor="#1d4ed8",
+        textColor=colors.HexColor("#1d4ed8"),
         spaceBefore=12,
         spaceAfter=5,
     )
@@ -907,7 +899,7 @@ def generate_pdf(
         "fontSize": 9.5,
         "leading": 15,
         "alignment": answer_alignment,
-        "textColor": "#334155",
+        "textColor": colors.HexColor("#334155"),
         "spaceAfter": 10,
     }
 
@@ -929,7 +921,7 @@ def generate_pdf(
         fontSize=11,
         leading=16,
         alignment=query_alignment,
-        textColor="#b91c1c",
+        textColor=colors.HexColor("#b91c1c"),
         spaceBefore=12,
         spaceAfter=5,
     )
@@ -945,7 +937,7 @@ def generate_pdf(
         "fontSize": 9.5,
         "leading": 15,
         "alignment": body_alignment,
-        "textColor": "#334155",
+        "textColor": colors.HexColor("#334155"),
         "spaceAfter": 7,
     }
 
@@ -957,57 +949,7 @@ def generate_pdf(
     )
 
     # ========================================================
-    # HELPER: FORMAT TEXT SAFELY
-    # ========================================================
-
-    def safe_paragraph_text(
-        value,
-    ) -> str:
-        """
-        Convert text into ReportLab-safe paragraph text.
-
-        HTML-sensitive characters are escaped while preserving
-        line breaks.
-        """
-
-        if value is None:
-            return ""
-
-        text = str(value)
-
-        # Normalize line endings.
-        text = text.replace(
-            "\r\n",
-            "\n",
-        )
-
-        text = text.replace(
-            "\r",
-            "\n",
-        )
-
-        # Escape HTML/XML characters.
-        text = escape(
-            text,
-            quote=False,
-        )
-
-        # Preserve blank lines.
-        text = text.replace(
-            "\n\n",
-            "<br/><br/>",
-        )
-
-        # Preserve remaining line breaks.
-        text = text.replace(
-            "\n",
-            "<br/>",
-        )
-
-        return text
-
-    # ========================================================
-    # HELPER: CREATE PARAGRAPH
+    # PARAGRAPH FACTORY
     # ========================================================
 
     def make_paragraph(
@@ -1015,26 +957,11 @@ def generate_pdf(
         style,
     ):
         """
-        Create a Paragraph with Arabic RTL handling
-        when supported.
+        Create a ReportLab Paragraph.
+
+        Kept inside generate_pdf() so it has access to the
+        current language/font configuration.
         """
-
-        if is_arabic and rtl_supported:
-
-            try:
-
-                return Paragraph(
-                    text,
-                    style,
-                )
-
-            except Exception:
-
-                # Safe fallback.
-                return Paragraph(
-                    text,
-                    style,
-                )
 
         return Paragraph(
             text,
@@ -1058,7 +985,7 @@ def generate_pdf(
         )
 
         subtitle_text = safe_paragraph_text(
-            f"البحث اللاهوتي المدعوم بالأدلة "
+            "البحث اللاهوتي المدعوم بالأدلة "
             f"والدفاعيات المسيحية — {language}"
         )
 
@@ -1091,7 +1018,7 @@ def generate_pdf(
         HRFlowable(
             width="100%",
             thickness=1,
-            color="#cbd5e1",
+            color=colors.HexColor("#cbd5e1"),
             spaceAfter=12,
         )
     )
@@ -1100,25 +1027,26 @@ def generate_pdf(
     # CONVERSATION HISTORY
     # ========================================================
 
+    # Keep the existing application's newest-first display.
     for turn in reversed(history):
 
+        query_value = turn.get(
+            "query",
+            "",
+        )
+
+        answer_value = turn.get(
+            "answer",
+            "",
+        )
+
         query = safe_paragraph_text(
-            turn.get(
-                "query",
-                "",
-            )
+            query_value
         )
 
         answer_text = safe_paragraph_text(
-            turn.get(
-                "answer",
-                "",
-            )
+            answer_value
         )
-
-        # ----------------------------------------------------
-        # Query / Answer labels
-        # ----------------------------------------------------
 
         if is_arabic:
 
@@ -1131,13 +1059,11 @@ def generate_pdf(
             answer_label = "Answer:"
 
         query_label = escape(
-            query_label,
-            quote=False,
+            query_label
         )
 
         answer_label = escape(
-            answer_label,
-            quote=False,
+            answer_label
         )
 
         story.append(
@@ -1172,7 +1098,7 @@ def generate_pdf(
             HRFlowable(
                 width="100%",
                 thickness=0.5,
-                color="#e2e8f0",
+                color=colors.HexColor("#e2e8f0"),
                 spaceBefore=8,
                 spaceAfter=10,
             )
@@ -1203,14 +1129,16 @@ def generate_pdf(
         # Weakest points
         # ----------------------------------------------------
 
-        for wp in getattr(
+        weakest_points = getattr(
             weakness_data,
             "weakest_points",
             [],
-        ):
+        )
+
+        for wp in weakest_points:
 
             bullet = safe_paragraph_text(
-                str(wp)
+                wp
             )
 
             story.append(
@@ -1310,7 +1238,9 @@ def generate_pdf(
     # BUILD PDF
     # ========================================================
 
-    doc.build(story)
+    doc.build(
+        story
+    )
 
     buffer.seek(0)
 
@@ -1460,7 +1390,9 @@ def render_sidebar():
                     use_container_width=True,
                 ):
 
-                    load_session(sess_id)
+                    load_session(
+                        sess_id
+                    )
 
                     st.rerun()
 
@@ -1470,17 +1402,11 @@ def render_sidebar():
         ):
 
             st.session_state.history = []
-
             st.session_state.sessions = {}
-
             st.session_state.active_session_id = None
-
             st.session_state.answer = None
-
             st.session_state.weakness = None
-
             st.session_state.hits = []
-
             st.session_state.query = ""
 
             clear_translation_cache()
@@ -1510,31 +1436,30 @@ def main():
 
     render_header()
 
-    # --------------------------------------------------------
-    # Evidence store
-    # --------------------------------------------------------
+    # ========================================================
+    # EVIDENCE STORE
+    # ========================================================
 
     try:
 
         store = get_store()
 
-    except Exception as exc:
+    except Exception:
 
         st.error(
-            "Could not open the canonical evidence index: "
-            f"{exc}"
+            "Could not open the canonical evidence index."
         )
 
         st.info(
-            "Set LEXICORE_DB_PATH and build the index with: "
-            f'python ingest.py --data ./data --db "{DB}"'
+            "Check LEXICORE_DB_PATH and make sure the "
+            "evidence database has been created."
         )
 
         st.stop()
 
-    # --------------------------------------------------------
-    # Sidebar
-    # --------------------------------------------------------
+    # ========================================================
+    # SIDEBAR
+    # ========================================================
 
     (
         stance,
@@ -1544,9 +1469,9 @@ def main():
         temp,
     ) = render_sidebar()
 
-    # --------------------------------------------------------
-    # Question
-    # --------------------------------------------------------
+    # ========================================================
+    # QUESTION
+    # ========================================================
 
     q = st.text_area(
         "Question / claim / counter-question",
@@ -1556,12 +1481,12 @@ def main():
             "Ask a theological question or follow up "
             "with a counter-question…"
         ),
-        max_chars=2000,
+        max_chars=5000,
     )
 
-    # --------------------------------------------------------
-    # Action buttons
-    # --------------------------------------------------------
+    # ========================================================
+    # ACTION BUTTONS
+    # ========================================================
 
     c1, c2 = st.columns(2)
 
@@ -1576,9 +1501,9 @@ def main():
         use_container_width=True,
     )
 
-    # --------------------------------------------------------
-    # Retrieval
-    # --------------------------------------------------------
+    # ========================================================
+    # RETRIEVAL
+    # ========================================================
 
     if retrieve or generate:
 
@@ -1598,23 +1523,38 @@ def main():
             else None
         )
 
-        with st.spinner(
-            "Retrieving evidence…"
-        ):
+        try:
 
-            st.session_state.hits = store.search(
-                q,
-                n=n,
-                categories=cats,
+            with st.spinner(
+                "Retrieving evidence…"
+            ):
+
+                st.session_state.hits = store.search(
+                    q,
+                    n=n,
+                    categories=cats,
+                )
+
+        except Exception:
+
+            st.error(
+                "Evidence retrieval failed."
             )
+
+            st.info(
+                "Please check the evidence database and "
+                "try again."
+            )
+
+            st.stop()
 
         st.session_state.run_id = (
             uuid.uuid4().hex
         )
 
-    # --------------------------------------------------------
-    # No evidence
-    # --------------------------------------------------------
+    # ========================================================
+    # NO EVIDENCE
+    # ========================================================
 
     if (
         not st.session_state.hits
@@ -1653,14 +1593,7 @@ def main():
             try:
 
                 # ------------------------------------------------
-                # IMPORTANT:
-                #
-                # Always generate the canonical answer in English.
-                #
-                # The selected language is a DISPLAY language.
-                #
-                # This gives us one stable source from which we can
-                # translate into any language.
+                # Always generate canonical answer in English.
                 # ------------------------------------------------
 
                 effective_query = f"""
@@ -1673,7 +1606,9 @@ Question:
 {q}
 
 IMPORTANT:
+
 The canonical response must be written in English.
+
 It will be translated separately for display if the user
 selects another language.
 """
@@ -1697,10 +1632,6 @@ selects another language.
                         time.perf_counter()
                         - started
                     )
-
-                    # ------------------------------------------------
-                    # Store the canonical English answer.
-                    # ------------------------------------------------
 
                     canonical_answer = (
                         result.answer
@@ -1726,16 +1657,12 @@ selects another language.
                             temperature=temp,
                         )
 
-                    st.session_state.elapsed = elapsed
+                    st.session_state.elapsed = (
+                        elapsed
+                    )
 
                     # ------------------------------------------------
-                    # Add the turn.
-                    #
-                    # BOTH fields intentionally contain the same
-                    # canonical English response.
-                    #
-                    # "original_answer" is the permanent source.
-                    # "answer" is kept for compatibility.
+                    # Store canonical English turn.
                     # ------------------------------------------------
 
                     st.session_state.history.append(
@@ -1747,10 +1674,7 @@ selects another language.
                     )
 
                     # ------------------------------------------------
-                    # VERY IMPORTANT:
-                    #
-                    # A new answer means all previous translation
-                    # caches are invalid.
+                    # New answer invalidates translations.
                     # ------------------------------------------------
 
                     clear_translation_cache()
@@ -1769,36 +1693,33 @@ selects another language.
                         expanded=False,
                     )
 
-                # Clear question field.
                 st.session_state.query = ""
 
-                # Rerun so the generated response appears.
                 st.rerun()
 
-            except APIError as api_err:
+            except Exception:
 
-                message = getattr(
-                    api_err,
-                    "message",
-                    str(api_err),
-                )
-
+                # IMPORTANT:
+                #
+                # The LLM layer already handles key rotation and
+                # internal Gemini failures.
+                #
+                # Never expose the raw exception here because it
+                # may reveal:
+                #
+                # - API details
+                # - quota information
+                # - key indexes
+                # - provider internals
+                # - network details
+                #
                 st.error(
-                    f"API Error encountered: {message}"
+                    "The response could not be generated."
                 )
 
                 st.info(
-                    "The model might be experiencing "
-                    "temporary high traffic or service "
-                    "availability problems. Please try "
-                    "generating the answer again."
-                )
-
-            except Exception as exc:
-
-                st.error(
-                    "An unexpected error occurred "
-                    f"during generation: {exc}"
+                    "Please check your Google API key "
+                    "configuration and try again."
                 )
 
     # ========================================================
@@ -1814,9 +1735,7 @@ selects another language.
         )
 
         # ----------------------------------------------------
-        # Get conversation in selected language.
-        #
-        # This does NOT modify the original English history.
+        # Display selected language.
         # ----------------------------------------------------
 
         display_history = get_display_history(
@@ -1827,25 +1746,34 @@ selects another language.
         # PDF
         # ----------------------------------------------------
 
-        pdf_bytes = generate_pdf(
-            display_history,
-            st.session_state.get(
-                "weakness"
-            ),
-            language=target_lang,
-        )
+        try:
 
-        st.download_button(
-            label=(
-                "📥 Download Research Thread as PDF"
-            ),
-            data=pdf_bytes,
-            file_name=(
-                "armor_research_report.pdf"
-            ),
-            mime="application/pdf",
-            use_container_width=True,
-        )
+            pdf_bytes = generate_pdf(
+                display_history,
+                st.session_state.get(
+                    "weakness"
+                ),
+                language=target_lang,
+            )
+
+            st.download_button(
+                label=(
+                    "📥 Download Research Thread as PDF"
+                ),
+                data=pdf_bytes,
+                file_name=(
+                    "armor_research_report.pdf"
+                ),
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
+        except Exception:
+
+            st.warning(
+                "The conversation was generated, but the "
+                "PDF could not be created."
+            )
 
         # ----------------------------------------------------
         # Conversation messages
@@ -1894,3 +1822,4 @@ selects another language.
 
 if __name__ == "__main__":
     main()
+
