@@ -195,6 +195,20 @@ async def _receive_loop(
                         ),
                     )
 
+                    turn_complete = getattr(
+                        server_content,
+                        "turn_complete",
+                        False,
+                    )
+                    if turn_complete:
+                        _put_nowait_bounded(
+                            state.transcript_queue,
+                            (
+                                "turn_complete",
+                                "",
+                            ),
+                        )
+
             # ------------------------------------------------
             # Model output
             # ------------------------------------------------
@@ -259,6 +273,17 @@ async def _receive_loop(
                 ),
             )
 
+            interrupted = getattr(
+                server_content,
+                "interrupted",
+                False,
+            )
+            if interrupted:
+                _put_nowait_bounded(
+                    state.output_queue,
+                    b"",
+                )
+
 
 async def _live_session(
     state: LiveVoiceState,
@@ -278,13 +303,35 @@ async def _live_session(
     )
 
     voice_instruction = f"""
-You are now operating in LIVE VOICE CONVERSATION mode.
-
-You are THE ARMOR / LexiCore.
+You are THE ARMOR in a live voice conversation.
 
 {system_prompt}
 
-VOICE CONVERSATION RULES:
+LIVE VOICE BEHAVIOR:
+
+Speak naturally.
+
+The selected application language is:
+{language}
+
+When the selected language is not English, prefer that language
+for your spoken response.
+
+Supported application languages are:
+
+English
+French
+Arabic
+Hausa
+Igbo
+Yoruba
+
+If the user speaks naturally in one of these languages,
+understand it and respond appropriately.
+
+Do not translate unnecessarily.
+
+Do not announce that you are changing languages.
 
 Speak naturally and conversationally.
 
@@ -292,25 +339,24 @@ Do not sound like you are reading an academic paper.
 
 Give direct answers first, then explain.
 
-Keep normal spoken responses reasonably concise.
-
 When the user asks a difficult theological question, reason carefully
+
 before answering.
 
 Maintain the same Christian and Catholic apologetic position required
+
 by the main THE ARMOR system.
 
-Do not invent Bible references, Quran references, Hadith numbers,
-historical claims, or evidence IDs.
+Keep spoken answers reasonably concise.
 
-The user's selected display language is:
+If the user asks for a detailed theological explanation,
+give the explanation naturally without sounding like you are
+reading a written article.
 
-{language}
+Never invent Scripture references, historical claims,
+Hadith numbers, quotations, or evidence IDs.
 
-If the user speaks another supported language, respond naturally
-in that language when appropriate.
-
-Current conversation context:
+Recent THE ARMOR conversation:
 
 {history_text}
 """
@@ -497,9 +543,10 @@ def start_live_voice(
 
 def stop_live_voice(
     state: LiveVoiceState,
+    audio_source=None,
 ):
     """
-    Stop the Live session.
+    Stop Gemini Live and clear any buffered model audio.
     """
 
     state.stop_event.set()
@@ -510,6 +557,13 @@ def stop_live_voice(
     )
 
     state.connected = False
+
+    if audio_source is not None:
+
+        try:
+            audio_source.clear()
+        except Exception:
+            pass
 
 
 def push_microphone_audio(
@@ -621,3 +675,22 @@ def build_voice_history(
             )
 
     return "\n".join(parts)
+
+def drain_transcript(
+    state: LiveVoiceState,
+) -> list[tuple[str, str]]:
+
+    events = []
+
+    while True:
+
+        event = read_transcript(
+            state
+        )
+
+        if event is None:
+            break
+
+        events.append(event)
+
+    return events

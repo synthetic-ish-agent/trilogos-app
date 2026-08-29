@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 import time
 import uuid
+import queue
+import asyncio
+import threading
 from pathlib import Path
 from io import BytesIO
 from copy import deepcopy
@@ -16,7 +19,6 @@ from reportlab.platypus import (
     Paragraph,
     Spacer,
 )
-import numpy as np
 
 from streamlit_webrtc import (
     WebRtcMode,
@@ -1794,8 +1796,11 @@ def render_live_voice(
     if stop_clicked:
 
         stop_live_voice(
-            state
-        )
+    state,
+    st.session_state.get(
+        "live_audio_source"
+    ),
+)
 
         st.rerun()
 
