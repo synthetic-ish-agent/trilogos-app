@@ -38,12 +38,6 @@ MODEL,
 
 from html import escape
 
-============================================================
-
-PAGE CONFIGURATION
-
-============================================================
-
 st.set_page_config(
 page_title="THE ARMOR",
 page_icon="🛡️",
@@ -58,12 +52,6 @@ st.markdown(
 """,
 unsafe_allow_html=True,
 )
-
-============================================================
-
-CONFIGURATION
-
-============================================================
 
 DB = os.getenv(
 "LEXICORE_DB_PATH",
@@ -85,12 +73,6 @@ SUPPORTED_LANGUAGES = [
 "Igbo",
 "Yoruba",
 ]
-
-============================================================
-
-EVIDENCE STORE
-
-============================================================
 
 @st.cache_resource(
 show_spinner="Initializing canonical evidence index..."
@@ -134,12 +116,6 @@ if store.count() == 0:
             store.add_records(records)
 
 return store
-
-============================================================
-
-SESSION STATE
-
-============================================================
 
 def init():
 """
@@ -192,13 +168,7 @@ for key, value in defaults.items():
         key,
         value,
     )
-
-============================================================
-
-TRANSLATION
-
-============================================================
-
+    
 def translate_text(
 text: str,
 target_lang: str,
@@ -497,12 +467,6 @@ with st.spinner(
         translated
     )
 
-============================================================
-
-SESSION / CONVERSATION MANAGEMENT
-
-============================================================
-
 def clear_translation_cache():
 """
 Remove all cached translations.
@@ -593,12 +557,6 @@ st.session_state.hits = []
 st.session_state.query = ""
 
 clear_translation_cache()
-
-============================================================
-
-PDF GENERATION
-
-============================================================
 
 def generate_pdf(
 history: list,
@@ -1262,12 +1220,6 @@ buffer.seek(0)
 
 return buffer.getvalue()
 
-============================================================
-
-HEADER
-
-============================================================
-
 def render_header():
 
 _, center_col, _ = st.columns(
@@ -1287,12 +1239,6 @@ with center_col:
         "Evidence-grounded theological research, "
         "apologetics, and cross-examination"
     )
-
-============================================================
-
-SIDEBAR
-
-============================================================
 
 def render_sidebar():
 
@@ -1435,12 +1381,6 @@ return (
     n,
     temp,
 )
-
-============================================================
-
-MAIN
-
-============================================================
 
 def main():
 
@@ -1824,12 +1764,6 @@ if st.session_state.get("history"):
         f"{st.session_state.get('elapsed', 0):.2f}s. "
         "Similarity is a ranking signal, not a truth probability."
     )
-
-============================================================
-
-APPLICATION ENTRY POINT
-
-============================================================
 
 if name == "main":
 main()
